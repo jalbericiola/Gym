@@ -98,7 +98,19 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                     update={"max_output_tokens": min(current, cap) if current else cap}
                 )
             elif self.config.max_total_seq_length is not None:
-                new_body = new_body.model_copy(update={"max_output_tokens": None})
+                # max_total_seq_length opts each turn into the full remaining
+                # sequence budget: when max_output_tokens is None the inference
+                # engine auto-clamps num_tokens_to_generate to
+                # max_sequence_length - len(prompt) (dynamic_engine.py:1254-1257).
+                # We previously force-nulled max_output_tokens here, which ALSO
+                # discarded any caller-supplied cap. A caller cap (e.g. the
+                # per-env dynamic max-len cap that megatron-rl injects as
+                # max_output_tokens) must be honored -- it only shortens
+                # generation, never exceeds max_seq -- so leave
+                # new_body.max_output_tokens untouched. It is already None unless
+                # the caller explicitly set it, so this preserves the prior
+                # default-budget behavior when no cap is supplied.
+                pass
 
             model_response = await self.server_client.post(
                 server_name=self.config.model_server.name,
@@ -119,6 +131,8 @@ class SimpleAgent(SimpleResponsesAPIAgent):
 
             output = model_response.output
             new_outputs.extend(output)
+            _turn_in = getattr(model_response.usage, "input_tokens", None) if model_response.usage else None
+            _turn_out = getattr(model_response.usage, "output_tokens", None) if model_response.usage else None
 
             if not usage:
                 usage = model_response.usage
@@ -160,6 +174,18 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                 )
                 new_outputs.append(tool_response)
 
+            # Total-sequence-budget guard: stop before the growing multi-turn prompt overflows
+            # max_total_seq_length. workplace_assistant's tool-call loop otherwise grows the prompt
+            # (input + prior outputs + tool results) until prompt_len + the per-step cap exceeds
+            # max_sequence_length, which the inference engine marks FAILED
+            # (MaxSequenceLengthOverflowError); a failed request whose future is only drained on the
+            # next bookkeeping pass can stall the whole rollout (the SL=32768 shared-prefix hang).
+            # The next turn's prompt is at least this turn's prompt+output, so if a further capped
+            # turn would not fit, commit now.
+            if self.config.max_total_seq_length is not None and _turn_in is not None:
+                per_step = self.config.max_output_tokens_per_step or 0
+                if _turn_in + (_turn_out or 0) + per_step >= self.config.max_total_seq_length:
+                    break
             # Check if max steps is not None and if we have exhausted it.
             if self.config.max_steps and step >= self.config.max_steps:
                 break
