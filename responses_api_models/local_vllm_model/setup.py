@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from os import getenv
 from sys import platform
 
 import setuptools
@@ -44,7 +45,9 @@ dependencies = [
 if platform == "darwin":
     dependencies.append("vllm==0.11.0")
 else:
-    dependencies.append("vllm==0.17.0")
+    dependencies.append(getenv("NEMOGYM_LOCAL_VLLM_REQUIREMENT", "vllm==0.17.0"))
 
+extra_dependencies = getenv("NEMOGYM_LOCAL_VLLM_EXTRA_REQUIREMENTS", "")
+dependencies.extend(dep.strip() for dep in extra_dependencies.split(",") if dep.strip())
 
 setuptools.setup(install_requires=dependencies)
