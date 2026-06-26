@@ -1084,6 +1084,12 @@ AGENT_FRAMEWORK_COMMIT={self.config.agent_framework_commit} \\
     scheduling_strategy="SPREAD",
     runtime_env={
         "py_executable": sys.executable,
+        # Propagate PATH so Ray workers inherit `apptainer` (installed on the bind-mounted
+        # home and prepended to PATH by launch_nemogym_server.sh's apptainer_on_path).
+        # Without this the worker starts with a clean env -> `apptainer: command not found`
+        # -> the .sif sandbox never launches -> the agent produces no trainable output ->
+        # every rollout drops to an empty placeholder -> prepare_trajectories: 0 usable.
+        "env_vars": {"PATH": os.environ.get("PATH", "")},
     },
     num_cpus=0.1,
 )

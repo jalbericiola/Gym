@@ -113,8 +113,22 @@ def setup_env_command(dir_path: Path, global_config_dict: DictConfig, prefix: st
 
     venv_python_fpath = venv_path / "bin/python"
     venv_activate_fpath = venv_path / "bin/activate"
+    # Completion marker written only after a fully successful build (see build_cmd below).
+    # The mere existence of bin/python is NOT sufficient: on cold/contended uv caches the
+    # per-server venv build can leave a venv whose package dirs exist but are truncated
+    # (e.g. openai missing types/batch, ray missing ray.util). Such a venv passes a
+    # file-existence check, uv only "Audited" it on the next launch, and the server then
+    # crashes on import -> ng_run tears the whole Ray cluster down -> every other server
+    # reports "Failed to connect to GCS". Gating skip on this marker means a partial/
+    # interrupted build is never trusted. See gym-venv-build-race.
+    venv_complete_marker = venv_path / ".nemo_gym_venv_complete"
     skip_venv_if_present = global_config_dict[SKIP_VENV_IF_PRESENT_KEY_NAME]
-    should_skip_venv_setup = bool(skip_venv_if_present) and venv_python_fpath.exists() and venv_activate_fpath.exists()
+    should_skip_venv_setup = (
+        bool(skip_venv_if_present)
+        and venv_python_fpath.exists()
+        and venv_activate_fpath.exists()
+        and venv_complete_marker.exists()
+    )
 
     # explicitly set python path if specified. In Google colab, ng_run fails due to uv pip install falls back to system python (/usr) without this and errors.
     # not needed for most clusters. should be safe in all scenarios, but only minimally tested outside of colab.
@@ -167,7 +181,16 @@ def setup_env_command(dir_path: Path, global_config_dict: DictConfig, prefix: st
             )
 
         prefix_cmd = f" > >(sed 's/^/({prefix}) /') 2> >(sed 's/^/({prefix}) /' >&2)"
-        env_setup_cmd = f"{uv_venv_cmd}{prefix_cmd} && source {venv_activate_fpath} && {install_cmd}{prefix_cmd}"
+        # A venv dir lacking the completion marker is partial/legacy. uv cannot repair
+        # truncated files in place (--allow-existing keeps them and metadata looks
+        # satisfied), so remove it for a genuinely clean rebuild. The marker is written
+        # only after the install fully succeeds, so an interrupted/raced build never
+        # leaves a venv that a later launch will trust.
+        clean_partial_cmd = f"{{ [ -e {venv_complete_marker} ] || rm -rf {venv_path}; }}"
+        env_setup_cmd = (
+            f"{clean_partial_cmd} && {uv_venv_cmd}{prefix_cmd} && source {venv_activate_fpath} "
+            f"&& {install_cmd}{prefix_cmd} && touch {venv_complete_marker}"
+        )
 
     return f"cd {dir_path} && {env_setup_cmd}"
 
