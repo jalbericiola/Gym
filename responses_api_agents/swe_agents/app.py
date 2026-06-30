@@ -1661,9 +1661,19 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
         if "SWE-rebench" in data_point["dataset_name"]:
             env_args = "--env _JAVA_OPTIONS=-Djava.net.preferIPv6Addresses=false "
 
+        # Apptainer's --writable-tmpfs writable layer is capped by `sessiondir max size`
+        # (64 MB default on HSG). SWE working trees are >100 MB, so `git reset --hard` in
+        # OpenHands initialize_runtime exhausts it -> ENOSPC -> init aborts before any model
+        # call -> empty trajectory -> reward 0 on EVERY rollout. Back the writable layer with
+        # a directory overlay on real disk (per-instance persistent_dir, rootless, no loop
+        # device) instead of the RAM tmpfs. Single builder for both agent + eval modes.
+        overlay_dir = params.persistent_dir / "apptainer_overlay"
+        (overlay_dir / "upper").mkdir(parents=True, exist_ok=True)
+        (overlay_dir / "work").mkdir(parents=True, exist_ok=True)
+
         # Launch Apptainer container and execute the script file
         apptainer_cmd = (
-            f"apptainer exec --writable-tmpfs --cleanenv --pid --no-mount home,tmp,bind-paths "
+            f"apptainer exec --overlay {overlay_dir} --cleanenv --pid --no-mount home,tmp,bind-paths "
             f"{env_args}"
             f"{mount_str} "
             f" {params.container} bash {container_script_path}"
