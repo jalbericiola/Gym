@@ -1536,9 +1536,17 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
         dataset_path_to_mount = str(params.instance_dataset_path)
         data_point = params.problem_info
 
-        # Fix localhost URLs not working sometimes
+        # Fix localhost URLs not working sometimes. Must be NON-FATAL: container_commands are
+        # joined with `&&`, so if this write fails the whole agent/eval command aborts (nonzero
+        # -> assert rc==0 raises -> empty patch + no completions). Under --overlay, /etc/hosts is
+        # a special file and a clobbering `>` fails with "Directory not empty"; use append + guard
+        # so localhost setup never kills the run (the image already ships a valid /etc/hosts).
         container_commands = []
-        container_commands.append("echo '127.0.0.1 localhost' >/etc/hosts")
+        container_commands.append("(echo '127.0.0.1 localhost' >>/etc/hosts 2>/dev/null || true)")
+        # Insurance: under the directory --overlay, the repo .git can appear owned by a different
+        # uid than the container user -> git refuses ("detected dubious ownership") -> `git add`/
+        # `git diff` yield an empty git_patch. Trust all repos. Non-fatal (keeps the && chain alive).
+        container_commands.append("(git config --global --add safe.directory '*' 2>/dev/null || true)")
 
         # Build mount arguments
         mount_args = [
@@ -1666,10 +1674,15 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
         # OpenHands initialize_runtime exhausts it -> ENOSPC -> init aborts before any model
         # call -> empty trajectory -> reward 0 on EVERY rollout. Back the writable layer with
         # a directory overlay on real disk (per-instance persistent_dir, rootless, no loop
-        # device) instead of the RAM tmpfs. Single builder for both agent + eval modes.
-        overlay_dir = params.persistent_dir / "apptainer_overlay"
-        (overlay_dir / "upper").mkdir(parents=True, exist_ok=True)
-        (overlay_dir / "work").mkdir(parents=True, exist_ok=True)
+        # device) instead of the RAM tmpfs.
+        # PER-MODE overlay dir: the agent and eval containers are started CONCURRENTLY
+        # (process_single_datapoint), so a shared upperdir means two live apptainer procs
+        # mutate the same overlay -> corrupt copy-up -> OpenHands `git diff` sees no coherent
+        # edits -> empty git_patch -> reward 0 on EVERY rollout. Keying by command.mode gives
+        # each container its own isolated writable layer. (apptainer uses the dir itself as the
+        # writable upperdir, so the old upper/+work/ subdirs were unused.)
+        overlay_dir = params.persistent_dir / f"apptainer_overlay_{command.mode}"
+        overlay_dir.mkdir(parents=True, exist_ok=True)
 
         # Launch Apptainer container and execute the script file
         apptainer_cmd = (
