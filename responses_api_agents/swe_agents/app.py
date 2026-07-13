@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import fcntl
 import glob
 import importlib.util
 import json
@@ -1106,14 +1107,23 @@ def runner_ray_remote(params_dict: dict[str, Any]) -> Optional[Path]:
 
 
 def update_metrics(metrics_fpath: Path, update_dict: Dict[str, Any]) -> None:
-    with metrics_fpath.open() as f:
-        existing_dict = json.loads(f.read())
+    # Called concurrently from ray-task and head processes on the same file; the
+    # unlocked read-during-truncate raced (JSONDecodeError -> /run 500). Serialize
+    # with a sibling lock and replace atomically so readers never see a partial file.
+    lock_fpath = metrics_fpath.with_name(metrics_fpath.name + ".lock")
+    with lock_fpath.open("a") as lock_f:
+        fcntl.flock(lock_f, fcntl.LOCK_EX)
+        try:
+            existing_dict = json.loads(metrics_fpath.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            existing_dict = {}
 
-    existing_dict = {k: v for k, v in existing_dict.items() if v is not None}
-    update_dict = {k: v for k, v in update_dict.items() if v is not None}
+        existing_dict = {k: v for k, v in existing_dict.items() if v is not None}
+        update_dict = {k: v for k, v in update_dict.items() if v is not None}
 
-    with metrics_fpath.open("w") as f:
-        json.dump(existing_dict | update_dict, f)
+        tmp_fpath = metrics_fpath.with_name(f"{metrics_fpath.name}.tmp{os.getpid()}")
+        tmp_fpath.write_text(json.dumps(existing_dict | update_dict))
+        tmp_fpath.replace(metrics_fpath)
 
 
 class ActiveContainerCommand(BaseModel):
@@ -1371,7 +1381,12 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
 
     def model_post_init(self, context: Any) -> None:
         run_session_id = f"{int(time.time() * 1000)}_{str(uuid.uuid4())[:8]}"
-        workspace_root = Path(__file__).parent
+        # Episode results/checkouts are heavy in inodes (a 128-episode wave checks out
+        # ~2.5M inodes of repos) — keep them on node-local /tmp, NOT Lustre, like the
+        # oh_episodes redirect. Set SWE_RESULTS_ROOT to move them back (e.g. to a
+        # Lustre path when a run needs trajectory archaeology).
+        workspace_root = Path(os.environ.get("SWE_RESULTS_ROOT", f"/dev/shm/swe_results_{os.environ.get('USER', 'nemogym')}"))
+        workspace_root.mkdir(parents=True, exist_ok=True)
         self._swe_bench_wrapper_server_config = SWEBenchWrapperServerConfig(
             run_session_id=run_session_id,
             base_results_dir=workspace_root / f"swebench_results_{run_session_id}",
@@ -1831,7 +1846,7 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
             f.write(params.model_dump_json(indent=4))
 
         try:
-            return await self._inner_responses(params, dataset_processor)
+            response = await self._inner_responses(params, dataset_processor)
         except Exception as e:
             traceback_file = params.persistent_dir / "traceback.err"
             with traceback_file.open("w") as f:
@@ -1840,6 +1855,16 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
             print(f"Hit an exception in {self.config.name}! See {traceback_file} for more details", file=sys.stderr)
 
             raise e
+
+        # Episode scratch lives on the gym node's /dev/shm and is ~1GB per instance
+        # (repo checkout, trajectories, eval output). Without this reap, completed
+        # dirs accumulate across waves and fill the tmpfs mid-link (Errno 28 on
+        # mkdir -> /run 500s -> whole groups of placeholder rollouts -> fatal).
+        # Everything the response needs was already read out of persistent_dir.
+        # Failed episodes keep their dir (traceback.err forensics); the launcher's
+        # aged-dir sweeper bounds those.
+        rmtree(params.persistent_dir, ignore_errors=True)
+        return response
 
     async def _inner_responses(
         self, params: SWEBenchWrapperInstanceConfig, dataset_processor: BaseDatasetHarnessProcessor
