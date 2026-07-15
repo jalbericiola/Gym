@@ -881,7 +881,7 @@ printf '{{"_test_completed": true, "exit_code": %d}}\\n' $TEST_EXIT \
 
 
 class OpenHandsHarnessProcessor(BaseDatasetHarnessProcessor):
-    def _verify_shared_miniforge_integrity(self, setup_dir: Path) -> None:
+    def verify_shared_miniforge_integrity(self, setup_dir: Path) -> None:
         """Self-heal the shared miniforge3 if a task episode corrupted it.
 
         Agent-driven `pip install` inside task containers has twice replaced
@@ -936,7 +936,7 @@ class OpenHandsHarnessProcessor(BaseDatasetHarnessProcessor):
 
             if openhands_dir.exists() and Path(openhands_dir / ".venv" / "bin" / "python").exists():
                 print(f"OpenHands already set up at {setup_dir}", flush=True)
-                self._verify_shared_miniforge_integrity(setup_dir)
+                self.verify_shared_miniforge_integrity(setup_dir)
                 return setup_dir
 
             print(f"Setting up OpenHands environment at {setup_dir}...", flush=True)
