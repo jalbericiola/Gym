@@ -263,35 +263,40 @@ build-backend = "setuptools.build_meta"
 
 [tool.uv]
 managed = true
-required-version = ">=0.9.18"
-exclude-dependencies = [
-    # Exclude unwanted dependencies from mlflow
-    "alembic",
-    "blinker",
-    "cffi",
-    "contourpy",
-    "cryptography",
-    "cycler",
-    "flask",
-    "flask-cors",
-    "graphene",
-    "graphql-core",
-    "graphql-relay",
-    "gunicorn",
-    "huey",
-    "joblib",
-    "kiwisolver",
-    "matplotlib",
-    "pillow",
-    "prettytable",
-    "scikit-learn",
-    "scipy",
-    "skops",
-    "sqlalchemy",
-    "threadpoolctl",
-    "wcwidth",
-    "werkzeug",
-    "waitress",
+# Exclude unwanted transitive dependencies from mlflow (we only need mlflow-skinny's surface).
+# Deliberately NOT `exclude-dependencies`: the production venv builds run uv 0.9.1, which
+# rejects that field — and an unknown field makes uv ignore this ENTIRE table (including
+# required-version, so the old ">=0.9.18" pin never fired). An override whose marker is
+# statically false (python_version < '0') removes every requirement edge to the package on
+# all uv versions in play (0.9.1 through 0.11.x) and locks identically to the exclusion list
+# (a string marker like sys_platform == 'never' would keep marker-gated entries in uv.lock).
+override-dependencies = [
+    "alembic; python_version < '0'",
+    "blinker; python_version < '0'",
+    "cffi; python_version < '0'",
+    "contourpy; python_version < '0'",
+    "cryptography; python_version < '0'",
+    "cycler; python_version < '0'",
+    "flask; python_version < '0'",
+    "flask-cors; python_version < '0'",
+    "graphene; python_version < '0'",
+    "graphql-core; python_version < '0'",
+    "graphql-relay; python_version < '0'",
+    "gunicorn; python_version < '0'",
+    "huey; python_version < '0'",
+    "joblib; python_version < '0'",
+    "kiwisolver; python_version < '0'",
+    "matplotlib; python_version < '0'",
+    "pillow; python_version < '0'",
+    "prettytable; python_version < '0'",
+    "scikit-learn; python_version < '0'",
+    "scipy; python_version < '0'",
+    "skops; python_version < '0'",
+    "sqlalchemy; python_version < '0'",
+    "threadpoolctl; python_version < '0'",
+    "wcwidth; python_version < '0'",
+    "werkzeug; python_version < '0'",
+    "waitress; python_version < '0'",
 ]
 
 [tool.setuptools.package-data]
@@ -389,9 +394,13 @@ ng_version = "nemo_gym.cli:version"
 nemo_gym_reinstall = "nemo_gym.cli:reinstall"
 ng_reinstall = "nemo_gym.cli:reinstall"
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["benchmarks", "resources_servers", "responses_api_agents", "responses_api_models", "nemo_gym"]
+# Static package list instead of `packages.find`: with the pyproject default namespaces=true,
+# discovery os.walk()s the ENTIRE tree during `pip install -e` metadata prep — including
+# cache/ (which holds the uv cache, 100k+ files) and every server's data/ — costing 12+
+# CPU-minutes per fresh server venv on Lustre. The find include list was already exact and
+# non-recursive, so this static list is discovery-equivalent and skips the walk entirely.
+[tool.setuptools]
+packages = ["benchmarks", "resources_servers", "responses_api_agents", "responses_api_models", "nemo_gym"]
 
 ################################################
 # Testing
