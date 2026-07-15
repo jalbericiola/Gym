@@ -1,0 +1,27 @@
+# Kicker-blend tau2 instance: identical to tau2_agent.yaml except max_steps.
+# The tau2 default of 200 lets self-play chats (policy is both agent and user)
+# degenerate into very long loops — one episode can serially burn ~400 policy
+# requests and hold a whole GRPO wave open for 30+ minutes. tau2 tasks resolve
+# well under 60 turns; beyond that the episode is noise, so cap it.
+tau2_agent:
+  responses_api_agents:
+    tau2:
+      entrypoint: app.py
+      domain: agent
+      description: Tau2 benchmark integration (kicker blend settings)
+      value: Evaluate multi-turn agentic capability with user simulation.
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      user_model_server:
+        type: responses_api_models
+        name: policy_model
+      num_workers: 1
+      user_llm_args: {}
+      max_steps: 60
+      debug: false
+      print_step_counts: false
+      datasets:
+      - name: example
+        type: example
+        jsonl_fpath: responses_api_agents/tau2/data/example.jsonl
