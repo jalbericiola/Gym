@@ -1,0 +1,57 @@
+# Kicker-blend genrm_compare: trimmed from genrm_compare.yaml.
+# - No genrm_model block: the judge instance comes from
+#   responses_api_models/genrm_model/configs/kicker_genrm_model.yaml
+#   (TP4, single GB200 het node) via NEMOGYM_EXTRA_CONFIG_PATHS; the bundled
+#   block here would collide and its DP2xTP4 layout needs 8 GPUs.
+# - No genrm_simple_agent_reasoning_off: it references a
+#   policy_model_reasoning_off instance we do not define, and the global
+#   config validator hard-fails on dangling refs even for unused instances.
+# - num_rollouts_per_prompt matches the kicker GRPO group size (8): cohort
+#   verify buffers per prompt and only returns relative rewards once the
+#   cohort is full, so a mismatch stalls the wave.
+genrm_compare_resources_server:
+  resources_servers:
+    genrm_compare:
+      entrypoint: app.py
+      genrm_model_server:
+        type: responses_api_models
+        name: genrm_model
+      num_rollouts_per_prompt: 8
+      genrm_responses_create_params:
+        input: []
+        max_output_tokens: 16384
+        temperature: 0.6
+        top_p: 0.95
+      comparison_strategy: circular
+      num_judges_per_comparison: 1
+      use_principle: false
+      aggregator_method: simple_tiebreaker
+      reasoning_bonus: 0.0
+      answer_bonus: 0.0
+      top_percentile: 0.2
+      group_reasoning_length_penalty_coeff: 0.0
+      group_answer_length_penalty_coeff: 0.0
+      default_score: 3.0
+      default_ranking: 3.5
+      debug_logging: false
+      genrm_parse_retries: 3
+      genrm_parse_retry_sleep_s: 0.2
+      domain: rlhf
+      verified: false
+      description: GenRM pairwise comparison for RLHF training (kicker settings)
+      value: Compare multiple candidate responses using GenRM model
+
+genrm_simple_agent:
+  responses_api_agents:
+    simple_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: genrm_compare_resources_server
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      datasets:
+      - name: example
+        type: example
+        jsonl_fpath: resources_servers/genrm_compare/data/example.jsonl
