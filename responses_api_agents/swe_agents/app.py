@@ -881,6 +881,52 @@ printf '{{"_test_completed": true, "exit_code": %d}}\\n' $TEST_EXIT \
 
 
 class OpenHandsHarnessProcessor(BaseDatasetHarnessProcessor):
+    def _verify_shared_miniforge_integrity(self, setup_dir: Path) -> None:
+        """Self-heal the shared miniforge3 if a task episode corrupted it.
+
+        Agent-driven `pip install` inside task containers has twice replaced
+        packages in this shared env with a task repo's ancient pins (packaging
+        23.1 on 2026-07-12; an ably-python dep set with packaging 21.3 on
+        2026-07-15), which crashes every subsequent OpenHands runner with
+        "No module named 'packaging.metadata'" and silently turns all SWE
+        waves fleet-wide into empty batches (reward 0, entropy 0). The
+        site-packages top-level dir is kept chmod a-w as the primary guard;
+        this preflight runs at every server start so any corruption that still
+        lands is bounded to one link's lifetime instead of persisting until a
+        human notices flat-zero reward curves.
+        """
+        py = setup_dir / "miniforge3" / "bin" / "python"
+        if not py.exists():
+            return
+        env = {**os.environ, "PYTHONNOUSERSITE": "1"}
+        probe = subprocess_run(
+            [str(py), "-c", "import packaging.metadata, typing_extensions, openai"],
+            capture_output=True,
+            env=env,
+        )
+        if probe.returncode == 0:
+            return
+        err_tail = probe.stderr.decode(errors="replace").strip().splitlines()[-1:]
+        print(f"Shared miniforge3 is corrupted ({err_tail}); self-healing...", flush=True)
+        sp = setup_dir / "miniforge3" / "lib" / "python3.12" / "site-packages"
+        subprocess_run(["chmod", "u+w", str(sp)], check=False)
+        subprocess_run(
+            f"chmod -R u+w {shlex.quote(str(sp))}/packaging* 2>/dev/null; "
+            f"{shlex.quote(str(py))} -m pip install -q --force-reinstall "
+            f"'packaging==26.0' 'typing-extensions>=4.11,<5'; "
+            f"chmod a-w {shlex.quote(str(sp))}",
+            shell=True,
+            check=False,
+            env=env,
+        )
+        verify = subprocess_run(
+            [str(py), "-c", "import packaging.metadata, typing_extensions"],
+            capture_output=True,
+            env=env,
+        )
+        outcome = "succeeded" if verify.returncode == 0 else "FAILED"
+        print(f"Shared miniforge3 self-heal {outcome}", flush=True)
+
     def setup(self) -> Path:
         setup_dir = self.parent_dir / "swe_openhands_setup"
 
@@ -890,6 +936,7 @@ class OpenHandsHarnessProcessor(BaseDatasetHarnessProcessor):
 
             if openhands_dir.exists() and Path(openhands_dir / ".venv" / "bin" / "python").exists():
                 print(f"OpenHands already set up at {setup_dir}", flush=True)
+                self._verify_shared_miniforge_integrity(setup_dir)
                 return setup_dir
 
             print(f"Setting up OpenHands environment at {setup_dir}...", flush=True)
