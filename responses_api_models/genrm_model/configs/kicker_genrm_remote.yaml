@@ -1,0 +1,20 @@
+# Remote GenRM judge: same instance name (`genrm_model`) the consumers resolve
+# (abstention judge_model_server, genrm_compare genrm_model_server), but backed
+# by the standalone serving job (serve_kicker_genrm.sh) instead of an in-job
+# LocalVLLM. vllm_model translates the gym's /v1/responses calls into
+# /v1/chat/completions against the remote endpoint; GenRM's special chat roles
+# (response_1/response_2/principle) pass through as plain messages and the
+# model's own chat template applies server-side. GENRM_BASE_URL is exported by
+# launch_nemogym_server.sh from the endpoint file at container start.
+genrm_model:
+  responses_api_models:
+    vllm_model:
+      entrypoint: app.py
+      base_url: ${oc.env:GENRM_BASE_URL}
+      api_key: EMPTY
+      model: genrm
+      return_token_id_information: false
+      uses_reasoning_parser: false
+      uses_interleaved_reasoning: false
+      chat_template_kwargs: null
+      extra_body: null
