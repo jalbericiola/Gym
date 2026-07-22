@@ -15,6 +15,7 @@
 import asyncio
 import atexit
 import json
+import time
 import yaml
 import resource
 import sys
@@ -34,6 +35,7 @@ import ray
 import requests
 import uvicorn
 from aiohttp import (
+    ClientConnectionError,
     ClientOSError,
     ClientResponse,
     ClientResponseError,
@@ -61,6 +63,7 @@ from nemo_gym.config_types import (
 from nemo_gym.global_config import (
     DRY_RUN_KEY_NAME,
     HEAD_SERVER_KEY_NAME,
+    NEMO_GYM_CONFIG_DICT_ENV_VAR_NAME,
     NEMO_GYM_CONFIG_PATH_ENV_VAR_NAME,
     RAY_HEAD_NODE_ADDRESS_KEY_NAME,
     GlobalConfigDictParser,
@@ -161,7 +164,11 @@ DISCONNECTED_CLIENT_OS_HELP_TEXT = """We've run into this issue in two different
 
 
 async def request(
-    method: str, url: str, _internal: bool = False, **kwargs: Unpack[_RequestOptions]
+    method: str,
+    url: str,
+    _internal: bool = False,
+    _max_connection_retries: Optional[int] = None,
+    **kwargs: Unpack[_RequestOptions],
 ) -> ClientResponse:  # pragma: no cover
     # Faster JSON dumps than the default aiohttp json
     if kwargs.get("json"):
@@ -171,25 +178,41 @@ async def request(
 
     client = get_global_aiohttp_client()
     num_tries = 1
+    # Connection-class errors (ServerDisconnectedError / ClientOSError, which
+    # includes ClientConnectorError) historically retried forever. That is the
+    # right call for transient overload, but when a server is GONE — e.g. the
+    # colocated gym died mid-run and restarted on different component ports —
+    # it wedges the caller permanently (f8rp1 5537456: 11.4M ClientOSError over
+    # 1.5h against a dead port). _max_connection_retries=None preserves the
+    # infinite behavior; ServerClient passes a bound so it can re-resolve the
+    # server map from the head and heal instead.
+    num_connection_errors = 0
     while True:
         try:
             return await client.request(method=method, url=url, **kwargs)
-        except ServerDisconnectedError:
-            global _NUM_SERVER_DISCONNECTED_ERROR
-            _NUM_SERVER_DISCONNECTED_ERROR += 1
-            if _NUM_SERVER_DISCONNECTED_ERROR % DISCONNECTED_CLIENT_OS_PRINT_INTERVAL == 0:
+        except ClientConnectionError as e:
+            # One branch for the WHOLE connection-failure family:
+            # ClientOSError (incl. ClientConnectorError/ECONNREFUSED),
+            # ServerDisconnectedError, ServerTimeoutError/ConnectionTimeoutError,
+            # ClientConnectionResetError. Bounding only ClientOSError +
+            # ServerDisconnectedError left connect timeouts falling through to
+            # the generic branch below, which for _internal callers retries
+            # forever SILENTLY — an unhealable wedge (review 2026-07-22).
+            global _NUM_SERVER_DISCONNECTED_ERROR, _NUM_CLIENT_OS_ERROR
+            if isinstance(e, ServerDisconnectedError):
+                _NUM_SERVER_DISCONNECTED_ERROR += 1
+                _err_count = _NUM_SERVER_DISCONNECTED_ERROR
+            else:
+                _NUM_CLIENT_OS_ERROR += 1
+                _err_count = _NUM_CLIENT_OS_ERROR
+            if _err_count % DISCONNECTED_CLIENT_OS_PRINT_INTERVAL == 0:
                 print(
-                    f"Hit {_NUM_SERVER_DISCONNECTED_ERROR} global `ServerDisconnectedError` while querying {url}.\n{DISCONNECTED_CLIENT_OS_HELP_TEXT}"
+                    f"Hit {_err_count} global `{type(e).__name__}` while querying {url}.\n{DISCONNECTED_CLIENT_OS_HELP_TEXT}"
                 )
 
-            await asyncio.sleep(0.5)
-        except ClientOSError:
-            global _NUM_CLIENT_OS_ERROR
-            _NUM_CLIENT_OS_ERROR += 1
-            if _NUM_CLIENT_OS_ERROR % DISCONNECTED_CLIENT_OS_PRINT_INTERVAL == 0:
-                print(
-                    f"Hit {_NUM_CLIENT_OS_ERROR} global `ClientOSError` while querying {url}.\n{DISCONNECTED_CLIENT_OS_HELP_TEXT}"
-                )
+            num_connection_errors += 1
+            if _max_connection_retries is not None and num_connection_errors >= _max_connection_retries:
+                raise
 
             await asyncio.sleep(0.5)
         except Exception as e:
@@ -231,6 +254,21 @@ async def get_response_json(response: ClientResponse) -> Any:
 
 
 DEFAULT_HEAD_SERVER_PORT = 11000
+
+# ~60s at the 0.5s retry sleep: long enough to ride out transient overload
+# (the historical reason connection errors retried forever), short enough
+# that a gym restart heals in about a minute instead of never.
+_SERVER_CLIENT_CONNECTION_RETRIES = 120
+_HEAD_CONFIG_CACHE_TTL_S = 15.0
+# head (host, port) -> (monotonic fetch time, DictConfig). Deliberately
+# lockless: an asyncio.Lock here binds to the first event loop that contends
+# on it and raises from any other loop — worse than the duplicate fetches it
+# would prevent. Coalescing is done with the cache TTL + an in-flight flag +
+# a negative cache on failure; races just cost an extra head GET.
+_HEAD_CONFIG_CACHE: dict = {}
+_HEAD_CONFIG_FETCH_INFLIGHT: bool = False
+_HEAD_CONFIG_LAST_FAILURE: float = 0.0
+_HEAD_CONFIG_FAILURE_BACKOFF_S = 5.0
 
 ServerStatus = Union[Literal["success"], Literal["connection_error"], Literal["timeout"], Literal["unknown_error"]]
 
@@ -277,18 +315,128 @@ class ServerClient(BaseModel):
     def _build_server_base_url(self, server_config_dict: OmegaConf) -> str:
         return f"http://{server_config_dict.host}:{server_config_dict.port}"
 
+    async def _refresh_global_config(self) -> None:
+        """Re-fetch the server map from the head server.
+
+        Component servers sit on randomly drawn ports recorded in
+        global_config_dict at startup. If the gym dies mid-run and its
+        supervisor restarts it (launch_nemogym_server.sh colocated branch),
+        every component comes back on a NEW port while the head port stays
+        pinned — so a client holding the old map floods dead sockets forever.
+        Re-resolving from the head heals that. Fetches are coalesced across
+        the many per-agent ServerClient instances via a module-level cache
+        keyed by head address (one HTTP fetch per window, every instance
+        still gets its own map updated).
+        """
+        global _HEAD_CONFIG_FETCH_INFLIGHT, _HEAD_CONFIG_LAST_FAILURE
+
+        head = self.head_server_config
+        cache_key = (head.host, head.port)
+
+        cached = _HEAD_CONFIG_CACHE.get(cache_key)
+        if cached is not None and (time.monotonic() - cached[0]) < _HEAD_CONFIG_CACHE_TTL_S:
+            self.global_config_dict = cached[1]
+            return
+
+        # Negative cache: if a probe just failed, don't stampede the head with
+        # one blocking GET per waiting coroutine while the gym reboots.
+        if (time.monotonic() - _HEAD_CONFIG_LAST_FAILURE) < _HEAD_CONFIG_FAILURE_BACKOFF_S:
+            await asyncio.sleep(2)
+            return
+
+        if _HEAD_CONFIG_FETCH_INFLIGHT:
+            await asyncio.sleep(2)
+            cached = _HEAD_CONFIG_CACHE.get(cache_key)
+            if cached is not None and (time.monotonic() - cached[0]) < _HEAD_CONFIG_CACHE_TTL_S:
+                self.global_config_dict = cached[1]
+            return
+
+        _HEAD_CONFIG_FETCH_INFLIGHT = True
+        try:
+            url = f"http://{head.host}:{head.port}/global_config_dict_yaml"
+            try:
+                # requests via to_thread: keep the event loop unblocked without
+                # routing through the global aiohttp client (whose connection
+                # errors are what brought us here).
+                response = await asyncio.to_thread(requests.get, url, timeout=30)
+                response.raise_for_status()
+                new_config = OmegaConf.create(yaml.safe_load(response.content.decode()))
+            except Exception as e:
+                _HEAD_CONFIG_LAST_FAILURE = time.monotonic()
+                print(
+                    f"[server_client] head re-resolution failed at {url} "
+                    f"({type(e).__name__}: {e}); gym may still be restarting — will retry"
+                )
+                return
+
+            _HEAD_CONFIG_CACHE[cache_key] = (time.monotonic(), new_config)
+            self.global_config_dict = new_config
+            # Keep the process-level cached copy that seeded us in sync for any
+            # future reader (get_global_config_dict falls back to this env var).
+            try:
+                environ[NEMO_GYM_CONFIG_DICT_ENV_VAR_NAME] = json.dumps(OmegaConf.to_container(new_config, resolve=True))
+            except Exception:
+                pass
+            print(f"[server_client] re-resolved server map from head at {url} after sustained connection errors")
+        finally:
+            _HEAD_CONFIG_FETCH_INFLIGHT = False
+
     async def request(
         self, server_name: str, url_path: str, method: str, **kwargs: Unpack[_RequestOptions]
     ) -> ClientResponse:
-        server_config_dict = get_first_server_config_dict(self.global_config_dict, server_name)
-        base_url = self._build_server_base_url(server_config_dict)
-
         if "json" in kwargs:
             json_obj = kwargs["json"]
             if isinstance(json_obj, BaseModel):
                 kwargs["json"] = json_obj.model_dump(exclude_unset=True)
 
-        return await request(method=method, url=f"{base_url}{url_path}", _internal=True, **kwargs)
+        # NOTE on retry semantics: connection-level retries here (and the
+        # bounded retries inside request()) RE-SEND the request. For agent
+        # /run calls that means an episode whose first execution died with the
+        # gym is re-run from scratch on the healed gym — deliberate, and the
+        # same behavior the old infinite-retry loop had. Callers treating /run
+        # as non-idempotent (nemo_gym_agent.py) rely on group-level handling
+        # for OTHER failure classes; connection-level re-sends are by design.
+        retried_stale_route = False
+        while True:
+            try:
+                server_config_dict = get_first_server_config_dict(self.global_config_dict, server_name)
+            except KeyError:
+                # A refreshed map can transiently miss a server while the gym
+                # head converges after a restart. Keep the never-raise
+                # contract: back off and re-resolve instead of surfacing a
+                # ConfigKeyError into rollout code.
+                await asyncio.sleep(2)
+                await self._refresh_global_config()
+                continue
+            base_url = self._build_server_base_url(server_config_dict)
+            try:
+                response = await request(
+                    method=method,
+                    url=f"{base_url}{url_path}",
+                    _internal=True,
+                    _max_connection_retries=_SERVER_CLIENT_CONNECTION_RETRIES,
+                    **kwargs,
+                )
+            except ClientConnectionError:
+                # ~60s of straight connection failures against one component:
+                # its port may have moved (gym restart). Re-resolve and retry
+                # with fresh addresses; never give up (matches the historical
+                # infinite-retry contract, but healable now).
+                await self._refresh_global_config()
+                continue
+
+            # Stale-route guard: after a gym restart, this server's OLD port
+            # can be re-drawn by a DIFFERENT server — TCP connects fine, the
+            # wrong app answers 404/405 for our url_path, and no connection
+            # error ever fires. Treat the first such response as a possibly
+            # stale map: re-resolve once and re-send. A second 404/405 is a
+            # real routing/config problem and is returned to the caller.
+            if response.status in (404, 405) and not retried_stale_route:
+                retried_stale_route = True
+                await self._refresh_global_config()
+                continue
+
+            return response
 
     async def get(
         self,
