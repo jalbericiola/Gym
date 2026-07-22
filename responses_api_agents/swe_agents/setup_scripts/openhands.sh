@@ -2,10 +2,6 @@
 set -e
 set -x  # Enable debug output
 
-# Resolve this script's own dir so we can locate sibling patch files regardless
-# of the cwd the caller invokes us from.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
 # Variables
 setup_dir=$SETUP_DIR
 miniforge_dir=$MINIFORGE_DIR
@@ -85,29 +81,6 @@ fi
 cd $openhands_dir
 echo "Checking out $agent_framework_commit..."
 git checkout $agent_framework_commit
-
-# Apply local NeMo-Gym patches on top of the pinned upstream commit. The checkout
-# above resets tracked files to $agent_framework_commit, so we re-apply on every
-# fresh setup. Currently: thread the off-policy training fields
-# (policy_epoch/kv_cache_epoch/num_evictions) through the conversation history so
-# NeMoGym's *ForTraining schema validates on every assistant turn, not just the
-# final response. Idempotent: skip a patch that is already applied; hard-fail if a
-# patch neither applies cleanly nor is already present (prevents silent drift).
-patch_dir="$SCRIPT_DIR/patches"
-if [ -d "$patch_dir" ]; then
-    for patch in "$patch_dir"/*.patch; do
-        [ -e "$patch" ] || continue
-        if git apply --reverse --check "$patch" >/dev/null 2>&1; then
-            echo "Patch already applied, skipping: $(basename "$patch")"
-        elif git apply --check "$patch" >/dev/null 2>&1; then
-            echo "Applying patch: $(basename "$patch")"
-            git apply "$patch"
-        else
-            echo "ERROR: patch neither applies cleanly nor is already applied: $(basename "$patch")" >&2
-            exit 1
-        fi
-    done
-fi
 
 # Build OpenHands
 echo "Building OpenHands (this may take 5-10 minutes)..."

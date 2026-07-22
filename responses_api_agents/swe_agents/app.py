@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
-import fcntl
 import glob
 import importlib.util
 import json
@@ -53,6 +52,7 @@ from nemo_gym.base_responses_api_agent import (
 )
 from nemo_gym.config_types import ModelServerRef
 from nemo_gym.global_config import OmegaConf, get_global_config_dict
+from nemo_gym.metrics_utils import read_json_metrics_file, update_json_metrics_file
 from nemo_gym.openai_utils import (
     NeMoGymResponse,
     NeMoGymResponseCreateParamsNonStreaming,
@@ -126,6 +126,17 @@ class SWEBenchWrapperConfig(BaseResponsesAPIAgentConfig):
     dataset_path: Optional[str] = Field(
         default=None,
         description="Path to the dataset for SWE-bench evaluation",
+    )
+
+    verify_golden_patch: bool = Field(
+        default=False,
+        description=(
+            "If True, skip the agent run and use the sample's golden patch "
+            "(instance_dict['patch']) as the model patch. The eval container "
+            "still runs, so this verifies that the dataset sample actually "
+            "resolves when its golden patch is applied. Currently supported "
+            "for dataset_name == 'swe-bench-ext'."
+        ),
     )
 
     agent_prompt_overrides: Optional[list[AgentPromptOverride]] = Field(
@@ -203,6 +214,9 @@ class SWEBenchWrapperInstanceConfig(SWEBenchWrapperServerConfig, SWEBenchWrapper
     agent_apptainer_command_str: Optional[str] = None
     agent_script: Optional[str] = None
 
+    # GRPO related fields
+    mask_sample: bool = False
+
     @property
     def instance_id(self) -> str:
         return self.problem_info["instance_id"]
@@ -212,6 +226,13 @@ class SWEBenchMetrics(BaseModel):
     resolved: Optional[bool] = None
     patch_exists: Optional[bool] = None
     model_patch: Optional[str] = None
+
+    # Failure-mode signals used to decide mask_sample downstream.
+    # agent_error_kind is one of: "max_iteration", "context_window",
+    # "stuck_in_loop", "other", or None if the agent finished cleanly.
+    agent_error_kind: Optional[str] = None
+    agent_timed_out: Optional[bool] = None
+    eval_timed_out: Optional[bool] = None
 
     # Profiling time metrics to report
     ray_queue_time: Optional[float] = None
@@ -259,7 +280,7 @@ class BaseDatasetHarnessProcessor(BaseModel):
         lock_path = lock_dir / f".{setup_dir.name}.lockdir"
 
         print(f"Acquiring {label} setup lock at {lock_path}", flush=True)
-        max_wait = 1800
+        max_wait = 3600
         poll_interval = 5
         waited = 0
         while True:
@@ -849,7 +870,7 @@ printf '{{"_test_completed": true, "exit_code": %d}}\\n' $TEST_EXIT \
             report_path.write_text(json.dumps(report, indent=2))
             return
 
-        test_output = test_output_path.read_text()
+        test_output = test_output_path.read_text(errors="replace")
         results = parser(test_output)
         results = {self._normalize_test_name(k): v for k, v in results.items()}
         passed = sorted(k for k, v in results.items() if v == "PASSED")
@@ -877,6 +898,167 @@ printf '{{"_test_completed": true, "exit_code": %d}}\\n' $TEST_EXIT \
                 "passed_match": passed == expected_passed,
             }
         }
+        report_path.write_text(json.dumps(report, indent=2))
+
+
+class SweBenchExtDatasetProcessor(BaseDatasetHarnessProcessor):
+    """Dataset processor for SWE-Bench-Ext format tasks."""
+
+    def _get_instance_dict(self) -> dict:
+        raw = self.config.problem_info.get("instance_dict", "{}")
+        if isinstance(raw, str):
+            return json.loads(raw)
+        return raw
+
+    def get_run_command(self) -> ExecuteContainerCommandArgs:
+        from responses_api_agents.swe_agents.swe_bench_ext.frameworks import (
+            get_framework_config,
+            get_test_command_with_output,
+        )
+
+        inst = self._get_instance_dict()
+
+        base_command = inst.get("test_command", "")
+        base_commit = inst.get("base_commit", "")
+        test_patch = inst.get("test_patch", "")
+        test_framework = inst.get("test_framework", "")
+
+        # Write test patch to persistent_dir (mounted into container)
+        test_patch_path = self.config.persistent_dir / "test_patch.diff"
+        test_patch_path.write_text(test_patch)
+
+        # Write eval metadata for host-side postprocessing
+        fail_to_pass = inst.get("FAIL_TO_PASS", inst.get("fail_to_pass", []))
+        pass_to_pass = inst.get("PASS_TO_PASS", inst.get("pass_to_pass", []))
+        if isinstance(fail_to_pass, str):
+            fail_to_pass = json.loads(fail_to_pass)
+        if isinstance(pass_to_pass, str):
+            pass_to_pass = json.loads(pass_to_pass)
+
+        eval_meta_dir = self.config.persistent_dir / "eval_meta"
+        eval_meta_dir.mkdir(parents=True, exist_ok=True)
+        (eval_meta_dir / "fail_to_pass.json").write_text(json.dumps(fail_to_pass))
+        (eval_meta_dir / "pass_to_pass.json").write_text(json.dumps(pass_to_pass))
+        (eval_meta_dir / "test_framework.txt").write_text(test_framework)
+
+        reset_cmd = f"git reset --hard {base_commit}" if base_commit else ""
+
+        # Use lighthouse to add structured output flags (--json, --junitxml, etc.)
+        # This is the same transformation swe_bench_ext_agent/task.py applies.
+        test_cmd = get_test_command_with_output(base_command, test_framework)
+        config = get_framework_config(test_framework, base_command)
+        result_file = config.get("result_file")
+
+        # Build the result file dump block (mirrors task.py's generate_test_run_script)
+        result_file_block = ""
+        if result_file:
+            if "*" in result_file:
+                result_file_block = f"""
+echo "<<<SWE_BENCH_EXT_RESULT_FILE_START>>>"
+for f in {result_file}; do
+    if [ -f "$f" ]; then
+        echo "=== FILE: $f ==="
+        cat "$f"
+        echo ""
+    fi
+done 2>/dev/null || true
+echo "<<<SWE_BENCH_EXT_RESULT_FILE_END>>>"
+"""
+            else:
+                result_file_block = f"""
+echo "<<<SWE_BENCH_EXT_RESULT_FILE_START>>>"
+if [ -f "{result_file}" ]; then
+    cat "{result_file}"
+fi
+echo "<<<SWE_BENCH_EXT_RESULT_FILE_END>>>"
+"""
+
+        cmd = f"""#!/bin/bash
+set -o pipefail
+
+date +\"%s.%N\" > {self.config.final_eval_apptainer_spinup_timestamp_mounted_fpath}
+
+{self._get_command_sleep_until_predictions_file()}
+
+# Try common repo locations in the container
+cd /testbed 2>/dev/null || cd /workspace/repo 2>/dev/null || cd /app 2>/dev/null || true
+
+# Reset to base commit if specified
+{reset_cmd}
+
+# Apply model patch (agent output or golden patch)
+git apply --reject --recount --ignore-space-change --ignore-whitespace /root/patch.diff || true
+
+# Apply test patch (adds/modifies test files)
+git apply --reject --recount --ignore-space-change --ignore-whitespace /root/test_patch.diff || true
+
+# Run tests with structured output and capture to log
+mkdir -p /trajectories_mount/eval_results /workspace/test-results
+set +e
+(
+echo "<<<SWE_BENCH_EXT_TEST_OUTPUT_START>>>"
+{test_cmd}
+test_exit_code=$?
+{result_file_block}
+echo "<<<SWE_BENCH_EXT_TEST_OUTPUT_END>>>"
+exit $test_exit_code
+) > /trajectories_mount/eval_results/test_output.log 2>&1
+TEST_EXIT=$?
+set -e
+
+printf '{{"_test_completed": true, "exit_code": %d}}\\n' $TEST_EXIT \
+  > /trajectories_mount/eval_results/report.json
+"""
+
+        search_path = os.path.join(
+            self.config.persistent_dir,
+            "eval_results",
+            "report.json",
+        )
+
+        return ExecuteContainerCommandArgs(
+            command=cmd,
+            expected_file_pattern=search_path,
+            mode="eval",
+            timeout=self.config.swebench_tests_timeout,
+        )
+
+    def postprocess_after_run(self, report_file: Path) -> None:
+        """Parse test output on the host using lighthouse's parsing library."""
+        from responses_api_agents.swe_agents.swe_bench_ext.utils import parse_and_check_tests
+
+        report_path = Path(report_file)
+        test_output_path = report_path.parent / "test_output.log"
+        instance_id = self.config.instance_id
+
+        if not test_output_path.exists():
+            report = {
+                instance_id: {
+                    "resolved": False,
+                    "patch_exists": True,
+                    "patch_successfully_applied": False,
+                    "error": "No test output produced inside container",
+                }
+            }
+            report_path.write_text(json.dumps(report, indent=2))
+            return
+
+        eval_meta_dir = self.config.persistent_dir / "eval_meta"
+        fail_to_pass = json.loads((eval_meta_dir / "fail_to_pass.json").read_text())
+        pass_to_pass = json.loads((eval_meta_dir / "pass_to_pass.json").read_text())
+        test_framework = (eval_meta_dir / "test_framework.txt").read_text().strip()
+
+        test_output = test_output_path.read_text(errors="replace")
+
+        result = parse_and_check_tests(
+            test_output=test_output,
+            test_framework=test_framework,
+            fail_to_pass=fail_to_pass,
+            pass_to_pass=pass_to_pass,
+            instance_id=instance_id,
+        )
+
+        report = {instance_id: result}
         report_path.write_text(json.dumps(report, indent=2))
 
 
@@ -997,7 +1179,7 @@ AGENT_FRAMEWORK_COMMIT={self.config.agent_framework_commit} \\
                 "export DEBUG_RUNTIME=False && "
             )
 
-        if data_point["dataset_name"] == "nv-internal-1":
+        if data_point["dataset_name"] == "nv-internal-1" or data_point["dataset_name"] == "swe-bench-ext":
             crypto_fix_cmd = (
                 "_crypto_fix_dir=$(mktemp -d /tmp/crypto_fix_XXXXXX) && "
                 "/openhands_setup/OpenHands/.venv/bin/python -m pip install "
@@ -1023,19 +1205,7 @@ AGENT_FRAMEWORK_COMMIT={self.config.agent_framework_commit} \\
         else:
             camel_case_tool_names_cmd = ""
 
-        # SWE-rebench-V2 and nv-internal-1 containers have /workspace baked in;
-        # the agent works in /{repo_name} or /app, so skip the safety check.
-        if "SWE-rebench" in data_point["dataset_name"] or data_point["dataset_name"] == "nv-internal-1":
-            workspace_check_cmd = ""
-        else:
-            workspace_check_cmd = (
-                "if [ -d /workspace ]; then "
-                "    echo 'Exiting because /workspace is mounted.' && "
-                "    echo 'Please make sure /workspace is not mounted inside of Apptainer before running OpenHands.' && "
-                "    echo 'This is because OpenHands DELETES EVERYTHING in the /workspace folder if it exists.' && "
-                "    exit 1; "
-                "fi && "
-            )
+        workspace_check_cmd = ""
 
         agent_main_cmd = (
             f"{workspace_check_cmd}"
@@ -1128,16 +1298,23 @@ AGENT_FRAMEWORK_COMMIT={self.config.agent_framework_commit} \\
 ########################################
 
 
+def _classify_agent_error(err: Optional[str]) -> Optional[str]:
+    if not err:
+        return None
+    s = str(err)
+    if "maximum iteration" in s:
+        return "max_iteration"
+    if "ContextWindow" in s or "context window" in s.lower():
+        return "context_window"
+    if "stuck in a loop" in s.lower():
+        return "stuck_in_loop"
+    return "other"
+
+
 @ray.remote(
     scheduling_strategy="SPREAD",
     runtime_env={
         "py_executable": sys.executable,
-        # Propagate PATH so Ray workers inherit `apptainer` (installed on the bind-mounted
-        # home and prepended to PATH by launch_nemogym_server.sh's apptainer_on_path).
-        # Without this the worker starts with a clean env -> `apptainer: command not found`
-        # -> the .sif sandbox never launches -> the agent produces no trainable output ->
-        # every rollout drops to an empty placeholder -> prepare_trajectories: 0 usable.
-        "env_vars": {"PATH": os.environ.get("PATH", "")},
     },
     num_cpus=0.1,
 )
@@ -1154,23 +1331,18 @@ def runner_ray_remote(params_dict: dict[str, Any]) -> Optional[Path]:
 
 
 def update_metrics(metrics_fpath: Path, update_dict: Dict[str, Any]) -> None:
-    # Called concurrently from ray-task and head processes on the same file; the
-    # unlocked read-during-truncate raced (JSONDecodeError -> /run 500). Serialize
-    # with a sibling lock and replace atomically so readers never see a partial file.
-    lock_fpath = metrics_fpath.with_name(metrics_fpath.name + ".lock")
-    with lock_fpath.open("a") as lock_f:
-        fcntl.flock(lock_f, fcntl.LOCK_EX)
-        try:
-            existing_dict = json.loads(metrics_fpath.read_text())
-        except (FileNotFoundError, json.JSONDecodeError):
-            existing_dict = {}
+    update_json_metrics_file(metrics_fpath, update_dict, log_prefix="swe_agents")
 
-        existing_dict = {k: v for k, v in existing_dict.items() if v is not None}
-        update_dict = {k: v for k, v in update_dict.items() if v is not None}
+# _TOOL_PARAM_BOOL_FIELDS_DEFAULT_FALSE = ("defer_loading",)
 
-        tmp_fpath = metrics_fpath.with_name(f"{metrics_fpath.name}.tmp{os.getpid()}")
-        tmp_fpath.write_text(json.dumps(existing_dict | update_dict))
-        tmp_fpath.replace(metrics_fpath)
+
+# def _dump_tool_as_tool_param(tool: BaseModel) -> Dict[str, Any]:
+#     """Dump a response Tool pydantic model to a ToolParam-compatible dict."""
+#     data = tool.model_dump()
+#     for key in _TOOL_PARAM_BOOL_FIELDS_DEFAULT_FALSE:
+#         if data.get(key) is None:
+#             data[key] = False
+#     return data
 
 
 class ActiveContainerCommand(BaseModel):
@@ -1257,9 +1429,11 @@ class RunOpenHandsAgent(BaseModel):
         finally:
             active_command.log_file.close()
 
-        assert active_command.process.returncode == 0, (
-            f"Command failed with return code {active_command.process.returncode}. Logs:\n{active_command.log_file_path.read_text()}"
-        )
+        if active_command.process.returncode != 0:
+            raise RuntimeError(
+                f"Command failed with return code {active_command.process.returncode}. "
+                f"Logs:\n{active_command.log_file_path.read_text(errors='replace')}"
+            )
 
         # Look for the expected file
         pred_files = glob.glob(command.expected_file_pattern, recursive=True)
@@ -1287,6 +1461,9 @@ class RunOpenHandsAgent(BaseModel):
         active_command.log_file.close()
 
     async def process_single_datapoint(self) -> Optional[Path]:
+        if self.config.verify_golden_patch:
+            return await self._run_golden_patch_verification()
+
         instance_id = self.config.instance_id
         if self.config.debug:
             profiler = Profiler(name=instance_id, base_profile_dir=self.config.profiling_mounted_dir)
@@ -1320,6 +1497,12 @@ class RunOpenHandsAgent(BaseModel):
             metrics.openhands_run_time += time.time()
             metrics.patch_exists = False
             metrics.final_eval_apptainer_spinup_time = None
+            # Detect wall-clock agent timeout: openhands_run_time (elapsed since start)
+            # reached or exceeded the configured swebench_agent_timeout.
+            metrics.agent_timed_out = (
+                metrics.openhands_run_time is not None
+                and metrics.openhands_run_time >= self.config.swebench_agent_timeout
+            )
             update_metrics(self.config.metrics_fpath, metrics.model_dump())
             if self.config.debug:
                 profiler.stop()
@@ -1333,6 +1516,8 @@ class RunOpenHandsAgent(BaseModel):
 
         with open(out_file, "r") as f:
             out_dict = json.loads(f.read().strip())
+
+        metrics.agent_error_kind = _classify_agent_error(out_dict.get("error"))
 
         patch = out_dict["test_result"]["git_patch"] or None
         patch = patch + "\n" if patch and not patch.endswith("\n") else patch
@@ -1388,6 +1573,12 @@ class RunOpenHandsAgent(BaseModel):
             print(f"Eval command failed for {instance_id}: {e}", flush=True)
             metrics.final_eval_time += time.time()
             metrics.patch_exists = True
+            # Detect wall-clock eval timeout: final_eval_time (elapsed since eval start)
+            # reached or exceeded the configured swebench_tests_timeout.
+            metrics.eval_timed_out = (
+                metrics.final_eval_time is not None
+                and metrics.final_eval_time >= self.config.swebench_tests_timeout
+            )
             update_metrics(self.config.metrics_fpath, metrics.model_dump())
             if self.config.debug:
                 profiler.stop()
@@ -1404,6 +1595,68 @@ class RunOpenHandsAgent(BaseModel):
 
         if self.config.debug:
             profiler.stop()
+
+        return report_file
+
+    async def _run_golden_patch_verification(self) -> Optional[Path]:
+        instance_id = self.config.instance_id
+        dataset_name = self.config.problem_info.get("dataset_name")
+        #TODO(sugam): add support for other datasets
+        if dataset_name != "swe-bench-ext":
+            raise NotImplementedError(
+                f"verify_golden_patch is only supported for dataset_name=='swe-bench-ext' "
+                f"(got {dataset_name!r})."
+            )
+
+        instance_dict = json.loads(self.config.problem_info["instance_dict"])
+        golden_patch = instance_dict.get("patch") or ""
+        if not golden_patch.strip():
+            raise ValueError(
+                f"No golden patch found in instance_dict['patch'] for {instance_id}."
+            )
+        if not golden_patch.endswith("\n"):
+            golden_patch += "\n"
+
+        metrics = SWEBenchMetrics(ray_queue_time=time.time() - self.config.ray_queue_timestamp)
+        metrics.model_patch = golden_patch
+        metrics.patch_exists = True
+
+        # Write golden patch where the agent would have written the model patch.
+        self.config.output_for_eval_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.config.output_for_eval_path.open("w") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "model_name_or_path": "golden_patch_verification",
+                        "instance_id": instance_id,
+                        "model_patch": golden_patch,
+                    }
+                )
+            )
+        with open(self.config.model_patch_path, "w") as f:
+            f.write(golden_patch)
+
+        metrics.final_eval_apptainer_spinup_time = -time.time()
+        metrics.final_eval_time = -time.time()
+
+        eval_active_command = await self._start_container_command(
+            self.config.eval_command, self.config.eval_apptainer_command_str
+        )
+        try:
+            report_file = await self._finish_container_command(eval_active_command, self.config.eval_command)
+        except Exception as e:
+            print(f"Golden-patch eval failed for {instance_id}: {e}", flush=True)
+            metrics.final_eval_time += time.time()
+            update_metrics(self.config.metrics_fpath, metrics.model_dump())
+            return None
+
+        final_eval_apptainer_spinup_timestamp = float(
+            self.config.final_eval_apptainer_spinup_timestamp_fpath.read_text()
+        )
+        metrics.final_eval_apptainer_spinup_time += final_eval_apptainer_spinup_timestamp
+        metrics.final_eval_time += time.time()
+
+        update_metrics(self.config.metrics_fpath, metrics.model_dump())
 
         return report_file
 
@@ -1428,12 +1681,7 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
 
     def model_post_init(self, context: Any) -> None:
         run_session_id = f"{int(time.time() * 1000)}_{str(uuid.uuid4())[:8]}"
-        # Episode results/checkouts are heavy in inodes (a 128-episode wave checks out
-        # ~2.5M inodes of repos) — keep them on node-local /tmp, NOT Lustre, like the
-        # oh_episodes redirect. Set SWE_RESULTS_ROOT to move them back (e.g. to a
-        # Lustre path when a run needs trajectory archaeology).
-        workspace_root = Path(os.environ.get("SWE_RESULTS_ROOT", f"/dev/shm/swe_results_{os.environ.get('USER', 'nemogym')}"))
-        workspace_root.mkdir(parents=True, exist_ok=True)
+        workspace_root = Path(__file__).parent
         self._swe_bench_wrapper_server_config = SWEBenchWrapperServerConfig(
             run_session_id=run_session_id,
             base_results_dir=workspace_root / f"swebench_results_{run_session_id}",
@@ -1516,23 +1764,24 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
             container_formatters = [container_formatters]
 
         if "SWE-rebench" in data_point["dataset_name"]:
-            instance_id_modified = instance_id.replace("__", "-")
-            last_dash = instance_id_modified.rfind("-")
-            if last_dash != -1:
-                sif_prefix = instance_id_modified[:last_dash] + ":" + instance_id_modified[last_dash + 1 :]
-            else:
-                sif_prefix = instance_id_modified
-
             for container_formatter in container_formatters:
+                # Exact match: {instance_id}.sif (e.g. badges__shields-4557.sif)
                 container_path = container_formatter.format(instance_id=instance_id)
                 if os.path.exists(container_path):
                     return container_path
+
+                # Fuzzy match: glob for files containing the instance_id
                 container_dir = os.path.dirname(container_formatter.format(instance_id="dummy"))
-                matches = glob.glob(os.path.join(container_dir, f"{sif_prefix}-*.sif"))
-                if matches:
-                    return matches[0]
+                for pattern in [
+                    f"{instance_id}*.sif",
+                    f"*{instance_id}*.sif",
+                ]:
+                    matches = glob.glob(os.path.join(container_dir, pattern))
+                    if matches:
+                        return matches[0]
             raise FileNotFoundError(
-                f"No SIF found for SWE-rebench instance {instance_id}. Looked for prefix: {sif_prefix}-*.sif"
+                f"No SIF found for SWE-rebench instance {instance_id}. "
+                f"Searched directories: {[os.path.dirname(cf.format(instance_id='dummy')) for cf in container_formatters]}"
             )
 
         if "R2E-Gym" in data_point["dataset_name"]:
@@ -1598,17 +1847,9 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
         dataset_path_to_mount = str(params.instance_dataset_path)
         data_point = params.problem_info
 
-        # Fix localhost URLs not working sometimes. Must be NON-FATAL: container_commands are
-        # joined with `&&`, so if this write fails the whole agent/eval command aborts (nonzero
-        # -> assert rc==0 raises -> empty patch + no completions). Under --overlay, /etc/hosts is
-        # a special file and a clobbering `>` fails with "Directory not empty"; use append + guard
-        # so localhost setup never kills the run (the image already ships a valid /etc/hosts).
+        # Fix localhost URLs not working sometimes
         container_commands = []
-        container_commands.append("(echo '127.0.0.1 localhost' >>/etc/hosts 2>/dev/null || true)")
-        # Insurance: under the directory --overlay, the repo .git can appear owned by a different
-        # uid than the container user -> git refuses ("detected dubious ownership") -> `git add`/
-        # `git diff` yield an empty git_patch. Trust all repos. Non-fatal (keeps the && chain alive).
-        container_commands.append("(git config --global --add safe.directory '*' 2>/dev/null || true)")
+        container_commands.append("echo '127.0.0.1 localhost' >/etc/hosts")
 
         # Build mount arguments
         mount_args = [
@@ -1649,7 +1890,11 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
         mount_args.append(f"--mount type=bind,src={miniforge3_path},dst={miniforge3_path},ro")
 
         # Add SWE-bench setup directory mount if available (for evaluation)
-        if command.mode == "eval" and data_point["dataset_name"] != "nv-internal-1":
+        # swe-bench-ext and nv-internal-1 don't use the swebench harness
+        if (
+            command.mode == "eval"
+            and data_point["dataset_name"] not in ("nv-internal-1", "swe-bench-ext")
+        ):
             # Mount the entire setup directory at both /swebench_setup and its original absolute path
             # This is needed because uv venv has hardcoded absolute paths
             mount_args.append(f"--mount type=bind,src={params.swebench_setup_dir},dst=/swebench_setup")
@@ -1704,6 +1949,13 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
                 f"--mount type=bind,src={eval_meta_dir / 'pass_to_pass.json'},dst=/eval_meta/pass_to_pass.json,ro"
             )
 
+        if command.mode == "eval" and data_point.get("dataset_name") == "swe-bench-ext":
+            test_patch_path = params.persistent_dir / "test_patch.diff"
+            if not params.model_patch_path.exists():
+                params.model_patch_path.write_text("")
+            mount_args.append(f"--mount type=bind,src={test_patch_path},dst=/root/test_patch.diff")
+            mount_args.append(f"--mount type=bind,src={params.model_patch_path},dst=/root/patch.diff")
+
         if command.mode == "agent" and "R2E-Gym" in data_point["dataset_name"]:
             # Remove R2E-Gym test-related files.
             for root_dir in ["", "/root", "/testbed"]:
@@ -1731,24 +1983,9 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
         if "SWE-rebench" in data_point["dataset_name"]:
             env_args = "--env _JAVA_OPTIONS=-Djava.net.preferIPv6Addresses=false "
 
-        # Apptainer's --writable-tmpfs writable layer is capped by `sessiondir max size`
-        # (64 MB default on HSG). SWE working trees are >100 MB, so `git reset --hard` in
-        # OpenHands initialize_runtime exhausts it -> ENOSPC -> init aborts before any model
-        # call -> empty trajectory -> reward 0 on EVERY rollout. Back the writable layer with
-        # a directory overlay on real disk (per-instance persistent_dir, rootless, no loop
-        # device) instead of the RAM tmpfs.
-        # PER-MODE overlay dir: the agent and eval containers are started CONCURRENTLY
-        # (process_single_datapoint), so a shared upperdir means two live apptainer procs
-        # mutate the same overlay -> corrupt copy-up -> OpenHands `git diff` sees no coherent
-        # edits -> empty git_patch -> reward 0 on EVERY rollout. Keying by command.mode gives
-        # each container its own isolated writable layer. (apptainer uses the dir itself as the
-        # writable upperdir, so the old upper/+work/ subdirs were unused.)
-        overlay_dir = params.persistent_dir / f"apptainer_overlay_{command.mode}"
-        overlay_dir.mkdir(parents=True, exist_ok=True)
-
         # Launch Apptainer container and execute the script file
         apptainer_cmd = (
-            f"apptainer exec --overlay {overlay_dir} --cleanenv --pid --no-mount home,tmp,bind-paths "
+            f"apptainer exec --writable-tmpfs --cleanenv --pid --no-mount home,tmp,bind-paths "
             f"{env_args}"
             f"{mount_str} "
             f" {params.container} bash {container_script_path}"
@@ -1868,6 +2105,8 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
 
         if params.problem_info["dataset_name"] == "nv-internal-1":
             dataset_processor = NVInternalDatasetProcessor(config=params)
+        elif params.problem_info["dataset_name"] == "swe-bench-ext":
+            dataset_processor = SweBenchExtDatasetProcessor(config=params)
         elif "SWE-rebench" in params.problem_info["dataset_name"]:
             dataset_processor = SWERebenchDatasetProcessor(config=params)
         elif "R2E-Gym" in params.problem_info["dataset_name"]:
@@ -1893,7 +2132,7 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
             f.write(params.model_dump_json(indent=4))
 
         try:
-            response = await self._inner_responses(params, dataset_processor)
+            return await self._inner_responses(params, dataset_processor)
         except Exception as e:
             traceback_file = params.persistent_dir / "traceback.err"
             with traceback_file.open("w") as f:
@@ -1902,16 +2141,6 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
             print(f"Hit an exception in {self.config.name}! See {traceback_file} for more details", file=sys.stderr)
 
             raise e
-
-        # Episode scratch lives on the gym node's /dev/shm and is ~1GB per instance
-        # (repo checkout, trajectories, eval output). Without this reap, completed
-        # dirs accumulate across waves and fill the tmpfs mid-link (Errno 28 on
-        # mkdir -> /run 500s -> whole groups of placeholder rollouts -> fatal).
-        # Everything the response needs was already read out of persistent_dir.
-        # Failed episodes keep their dir (traceback.err forensics); the launcher's
-        # aged-dir sweeper bounds those.
-        rmtree(params.persistent_dir, ignore_errors=True)
-        return response
 
     async def _inner_responses(
         self, params: SWEBenchWrapperInstanceConfig, dataset_processor: BaseDatasetHarnessProcessor
@@ -1930,6 +2159,39 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
             metrics_to_update["resolved"] = resolved
         else:
             metrics_to_update["resolved"] = False
+
+        # Decide whether to mask this sample from the GRPO gradient.
+        # 1) Patch passed eval but agent did not actually submit (hit max-turns
+        #    or blew the context window) — the reward is accidental.
+        # 2) Final eval step timed out — reward is unreliable.
+        # 3) Agent itself timed out (wall-clock) — mask regardless of resolved.
+        metrics_fpath = None
+        try:
+            metrics_fpath = params.metrics_fpath
+            persisted_metrics = SWEBenchMetrics.model_validate(
+                read_json_metrics_file(metrics_fpath, log_prefix="swe_agents")
+            )
+        except Exception as e:
+            # metrics_fpath can be corrupted/unreadable if a concurrent writer raced
+            # this file (see update_metrics above). Don't fail the whole rollout over
+            # a metrics-tracking file; fall back to defaults (sample stays unmasked)
+            # and keep going.
+            print(
+                f"WARNING: swe_agents: _inner_responses: error reading persisted metrics "
+                f"(path={metrics_fpath}): {type(e).__name__} {e}",
+                flush=True,
+            )
+            persisted_metrics = SWEBenchMetrics()
+        resolved_now = metrics_to_update.get("resolved", False)
+        agent_error_kind = persisted_metrics.agent_error_kind
+        eval_timed_out = bool(persisted_metrics.eval_timed_out)
+        agent_timed_out = bool(persisted_metrics.agent_timed_out)
+        if (
+            (resolved_now and agent_error_kind in ("max_iteration", "context_window"))
+            or eval_timed_out
+            or agent_timed_out
+        ):
+            params.mask_sample = True
 
         trajectories_dir = params.persistent_dir / "trajectories"
         chat_completions_trajectory, chat_completions_tools = self.get_openhands_trajectory_from_completions(
@@ -1957,7 +2219,7 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
             tools=tools,
             metadata={
                 "input": json.dumps([i.model_dump() for i in input_items]),
-                "metrics": params.metrics_fpath.read_text(),
+                "metrics": json.dumps(read_json_metrics_file(params.metrics_fpath, log_prefix="swe_agents")),
                 "instance_config": params.model_dump_json(),
             },
         )
@@ -1974,7 +2236,14 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
                 "input": json.loads(metadata["input"]),
                 "tools": [t.model_dump() for t in response.tools] if response.tools else [],
             }
-            metrics = SWEBenchMetrics.model_validate_json(metadata["metrics"])
+            try:
+                metrics = SWEBenchMetrics.model_validate_json(metadata["metrics"])
+            except Exception as e:
+                print(
+                    f"WARNING: swe_agents: run: error parsing response metrics: {type(e).__name__} {e}",
+                    flush=True,
+                )
+                metrics = SWEBenchMetrics()
 
             return SWEBenchVerifyResponse(
                 responses_create_params=responses_create_params,
