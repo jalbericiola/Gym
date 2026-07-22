@@ -82,6 +82,32 @@ cd $openhands_dir
 echo "Checking out $agent_framework_commit..."
 git checkout $agent_framework_commit
 
+# Apply local NeMo-Gym patches on top of the pinned upstream commit. The checkout
+# above resets tracked files to $agent_framework_commit, so we re-apply on every
+# fresh setup. Currently: thread the off-policy training fields
+# (policy_epoch/kv_cache_epoch/num_evictions) through the conversation history so
+# NeMoGym's *ForTraining schema validates on every assistant turn, not just the
+# final response. Idempotent: skip a patch that is already applied; hard-fail if a
+# patch neither applies cleanly nor is already present (prevents silent drift).
+# (This loop was dropped in the upstream refactor and restored by the
+# swe-parity-port review 2026-07-22 — without it every multi-turn episode 500s
+# against the Megatron policy server with a pydantic ValidationError.)
+patch_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/patches"
+if [ -d "$patch_dir" ]; then
+    for patch in "$patch_dir"/*.patch; do
+        [ -e "$patch" ] || continue
+        if git apply --reverse --check "$patch" >/dev/null 2>&1; then
+            echo "Patch already applied, skipping: $(basename "$patch")"
+        elif git apply --check "$patch" >/dev/null 2>&1; then
+            echo "Applying patch: $(basename "$patch")"
+            git apply "$patch"
+        else
+            echo "ERROR: patch neither applies cleanly nor is already applied: $(basename "$patch")" >&2
+            exit 1
+        fi
+    done
+fi
+
 # Build OpenHands
 echo "Building OpenHands (this may take 5-10 minutes)..."
 export INSTALL_DOCKER=0

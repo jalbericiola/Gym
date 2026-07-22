@@ -1081,8 +1081,19 @@ class OpenHandsHarnessProcessor(BaseDatasetHarnessProcessor):
         if not py.exists():
             return
         env = {**os.environ, "PYTHONNOUSERSITE": "1"}
+        # Corruption test = the base packages openhands.sh itself installs.
+        # `openai` only lands in this env via later container-side activity, so
+        # its absence on a FRESH setup is normal — probe it separately as a
+        # warning, never a heal trigger (port review 2026-07-22: healing on
+        # missing openai chmod-locks site-packages before the runtime bootstrap
+        # has written its deps, bricking first episodes on fresh snapshots).
+        openai_probe = subprocess_run(
+            [str(py), "-c", "import openai"], capture_output=True, env=env
+        )
+        if openai_probe.returncode != 0:
+            print("Shared miniforge3: openai not present yet (normal on fresh setup)", flush=True)
         probe = subprocess_run(
-            [str(py), "-c", "import packaging.metadata, typing_extensions, openai"],
+            [str(py), "-c", "import packaging.metadata, typing_extensions"],
             capture_output=True,
             env=env,
         )
@@ -1117,9 +1128,25 @@ class OpenHandsHarnessProcessor(BaseDatasetHarnessProcessor):
             miniforge_dir = setup_dir / "miniforge3"
 
             if openhands_dir.exists() and Path(openhands_dir / ".venv" / "bin" / "python").exists():
-                print(f"OpenHands already set up at {setup_dir}", flush=True)
-                self.verify_shared_miniforge_integrity(setup_dir)
-                return setup_dir
+                # Guard against a stale pre-existing checkout at a DIFFERENT
+                # pinned commit (e.g. a setup dir inherited from an in-place
+                # server run): silently running the wrong scaffold is exactly
+                # the class of bug this port fixes. Re-run setup on mismatch.
+                head = subprocess_run(
+                    ["git", "-C", str(openhands_dir), "rev-parse", "HEAD"],
+                    capture_output=True,
+                    text=True,
+                )
+                if head.returncode == 0 and head.stdout.strip() != self.config.agent_framework_commit:
+                    print(
+                        f"OpenHands checkout at {head.stdout.strip()[:12]} != pinned "
+                        f"{self.config.agent_framework_commit[:12]}; re-running setup",
+                        flush=True,
+                    )
+                else:
+                    print(f"OpenHands already set up at {setup_dir}", flush=True)
+                    self.verify_shared_miniforge_integrity(setup_dir)
+                    return setup_dir
 
             print(f"Setting up OpenHands environment at {setup_dir}...", flush=True)
             rmtree(setup_dir, ignore_errors=True)
@@ -1681,7 +1708,13 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
 
     def model_post_init(self, context: Any) -> None:
         run_session_id = f"{int(time.time() * 1000)}_{str(uuid.uuid4())[:8]}"
-        workspace_root = Path(__file__).parent
+        # Episode results/checkouts are heavy in inodes (a 128-episode wave checks out
+        # ~2.5M inodes of repos) — keep them on node-local /dev/shm, NOT the Lustre
+        # snapshot dir. Set SWE_RESULTS_ROOT to move them back (e.g. to a Lustre path
+        # when a run needs trajectory archaeology). Re-grafted after the upstream
+        # refactor reverted it to Path(__file__).parent (swe-parity-port review).
+        workspace_root = Path(os.environ.get("SWE_RESULTS_ROOT", f"/dev/shm/swe_results_{os.environ.get('USER', 'nemogym')}"))
+        workspace_root.mkdir(parents=True, exist_ok=True)
         self._swe_bench_wrapper_server_config = SWEBenchWrapperServerConfig(
             run_session_id=run_session_id,
             base_results_dir=workspace_root / f"swebench_results_{run_session_id}",
@@ -2132,7 +2165,7 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
             f.write(params.model_dump_json(indent=4))
 
         try:
-            return await self._inner_responses(params, dataset_processor)
+            response = await self._inner_responses(params, dataset_processor)
         except Exception as e:
             traceback_file = params.persistent_dir / "traceback.err"
             with traceback_file.open("w") as f:
@@ -2141,6 +2174,17 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
             print(f"Hit an exception in {self.config.name}! See {traceback_file} for more details", file=sys.stderr)
 
             raise e
+
+        # Episode scratch lives on the gym node's /dev/shm and is ~1GB per instance
+        # (repo checkout, trajectories, eval output). Without this reap, completed
+        # dirs accumulate across waves and fill the tmpfs mid-link (Errno 28 on
+        # mkdir -> /run 500s -> whole groups of placeholder rollouts -> fatal).
+        # Everything the response needs was already read out of persistent_dir.
+        # Failed episodes keep their dir (traceback.err forensics); the launcher's
+        # aged-dir sweeper bounds those. Re-grafted after the upstream refactor
+        # dropped it (swe-parity-port review 2026-07-22).
+        rmtree(params.persistent_dir, ignore_errors=True)
+        return response
 
     async def _inner_responses(
         self, params: SWEBenchWrapperInstanceConfig, dataset_processor: BaseDatasetHarnessProcessor

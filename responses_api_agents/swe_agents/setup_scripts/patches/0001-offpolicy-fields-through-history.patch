@@ -1,8 +1,14 @@
+Rebased 2026-07-22 onto pjin-nvidia/nv-openhands@ebdc8bc4 (swe-parity-port):
+the client's fields_to_remove/provider_specific_fields context changed upstream
+(latency metrics + token-id guard); message.py and conversation_memory.py hunks
+unchanged. Threads policy_epoch/kv_cache_epoch/num_evictions through the
+conversation history so NeMoGym's *ForTraining schema validates on every
+assistant turn.
+
 diff --git a/openhands/agenthub/nemo_gym_client.py b/openhands/agenthub/nemo_gym_client.py
-index 01cd1c92e..691169594 100644
 --- a/openhands/agenthub/nemo_gym_client.py
 +++ b/openhands/agenthub/nemo_gym_client.py
-@@ -82,18 +82,31 @@ class NemoGymClient:
+@@ -82,18 +82,31 @@
          if tools:
              params["tools"] = tools
  
@@ -34,8 +40,8 @@ index 01cd1c92e..691169594 100644
 +            elif all(field in message for field in detect_fields):
                  last_occurrence_idx_seen = True
  
-         model_response = await self.ng_server_client.post(
-@@ -115,6 +128,12 @@ class NemoGymClient:
+         # Measure per-call round-trip latency so it's surfaced in
+@@ -124,6 +137,12 @@
                  "prompt_token_ids": response_message_dict["prompt_token_ids"],
                  "generation_token_ids": response_message_dict["generation_token_ids"],
                  "generation_log_probs": response_message_dict["generation_log_probs"],
