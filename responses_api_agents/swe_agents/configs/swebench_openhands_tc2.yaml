@@ -22,8 +22,8 @@ swe_agents_train:
       agent_framework: openhands
       agent_config: responses_api_agents/swe_agents/configs/oh_config.toml
       agent_max_turns: 200
-      agent_framework_repo: https://github.com/pjin-nvidia/nv-openhands.git
-      agent_framework_commit: ebdc8bc4cc46496a364b81ec04cf52edb77154ea  # pragma: allowlist secret  # pjin stable gym branch pin (ultra-v3-clean-merge-swe-dev-20260630)
+      agent_framework_repo: https://github.com/sdevare-nv/nv-OpenHands.git
+      agent_framework_commit: 87fbbca1402e6cbefe97df03e4cefce8a5ba378a  # pragma: allowlist secret  # sdevare REFERENCE pin: proven at 0.3 resolve against these container images; includes the patch-export mime fix. pjin's later ebdc8bc4 computes workspace paths for a different image layout ('Failed to cd to /workspace/repo', canary 2026-07-23).
       # Reference container sources first (exact order), then our extra mirrors.
       container_formatter:
         - /lustre/fsw/portfolios/llmservice/users/sdevare/images/swerebench/{instance_id}.sif
