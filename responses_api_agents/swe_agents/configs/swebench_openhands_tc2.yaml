@@ -40,7 +40,7 @@ swe_agents_train:
       apptainer_memory_limit_mb: 65536
       command_exec_timeout: 300
       openhands_should_log: false
-      concurrency: 1024
+      concurrency: 128  # single-node colocated gym = 144 cores; 1024 oversubscribes -> Ray "failed to startup worker" (probe 5572719: mechanism OK, load is the cause). Throughput knob only; gbs unchanged. Reference distributes gym across nodes, we cannot colocated.
       dataset_path: /lustre/fsw/portfolios/llmservice/users/sdevare/repos/ultra/datasets/swe/blends/large_root_cause_curriculum_with_mercor_ots_plus_singlefile_swerebench_overlap_fix.jsonl
       agent_prompt_override_random: true
       # Reference roster: CodeActAgent ONLY (sdevare/pjin training configs keep
