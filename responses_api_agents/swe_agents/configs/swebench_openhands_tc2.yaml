@@ -46,7 +46,12 @@ swe_agents_train:
       command_exec_timeout: 300
       openhands_should_log: false
       concurrency: 512  # nproc raise (launcher) is the real fix for worker-startup; 128 was over-conservative -> waves too slow to bank within a 3h40 link (canary 5574009 exited mid-straggler). 512 = ~40min waves, straggler margin, under 1024 memory pressure.
-      dataset_path: /lustre/fsw/portfolios/llmservice/users/sdevare/repos/ultra/datasets/swe/blends/large_root_cause_curriculum_with_mercor_ots_plus_singlefile_swerebench_overlap_fix.jsonl
+      # pjin's exact training dataset (their config, verified 2026-07-24). NOTE the
+      # name: 'mixed-then-allzero-by-patchsize' -- it is ORDERED, mixed rows first
+      # then an all-zero-reward tail. With NEMOGYM_CURRICULUM=1 we read from the
+      # start, so early iterations sample the mixed region; a late-run drop to
+      # reward 0 would be the curriculum tail, NOT a regression.
+      dataset_path: /lustre/fsw/portfolios/llmservice/users/pjin/data/swe/nano-bear-mixed-then-allzero-by-patchsize.jsonl
       agent_prompt_override_random: true
       # Reference roster: CodeActAgent ONLY (sdevare/pjin training configs keep
       # codex+opencode commented out). Our tc2 previously mixed all three; with
