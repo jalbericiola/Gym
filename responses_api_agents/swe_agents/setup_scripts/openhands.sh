@@ -191,7 +191,13 @@ if [ ! -x "$_NG_VENV_PY" ]; then
 fi
 echo "OpenHands venv interpreter: $_NG_VENV_PY"
 
-"$_NG_VENV_PY" -m pip install datasets huggingface_hub packaging==26.0 wandb
+# gprof2dot/pydot are declared nemo_gym deps (pyproject.toml) pulled in by
+# nemo_gym.profiling <- nemo_gym.server_utils. They are NOT optional: the agent's
+# very first import (NemoGymClient -> ServerClient) walks that chain, so without
+# them every episode dies before doing any work. They are installed explicitly
+# because the nemo_gym install below uses --no-deps (to avoid clobbering
+# OpenHands' own pins).
+"$_NG_VENV_PY" -m pip install datasets huggingface_hub packaging==26.0 wandb gprof2dot pydot
 
 # Install the CURRENT tree's nemo_gym into the OpenHands venv.
 #
@@ -217,9 +223,16 @@ if [ -d "$_NG_SRC/nemo_gym" ] && [ -x "$_NG_VENV_PY" ]; then
     echo "Syncing nemo_gym from tree ($_NG_SRC) into the OpenHands venv..."
     "$_NG_VENV_PY" -m pip install --no-deps --force-reinstall --no-cache-dir "$_NG_SRC" || {
         echo "FATAL: nemo_gym install into the OpenHands venv failed" >&2; exit 1; }
+    # Verify the EXACT chain the sandboxed agent walks on its first import
+    # (codeact_agent -> nemo_gym_client -> ServerClient -> profiling), not just a
+    # token module. An earlier check imported only global_config and therefore
+    # passed while nemo_gym.profiling was still missing gprof2dot -- the failure
+    # then surfaced 36 times per link at runtime instead of once at setup.
     "$_NG_VENV_PY" - <<'PYCHK' || { echo "FATAL: nemo_gym in the OpenHands venv is inconsistent" >&2; exit 1; }
+import nemo_gym, nemo_gym.global_config, nemo_gym.server_utils, nemo_gym.profiling
 from nemo_gym import CACHE_DIR, PARENT_DIR, RESULTS_DIR, WORKING_DIR
 from nemo_gym.global_config import get_global_config_dict
+from nemo_gym.server_utils import ServerClient
 print("nemo_gym venv sync verified")
 PYCHK
 else
