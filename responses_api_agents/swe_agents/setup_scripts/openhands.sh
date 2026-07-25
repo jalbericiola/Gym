@@ -176,6 +176,23 @@ echo "Installing datasets package..."
 
 poetry run python -m pip install datasets huggingface_hub packaging==26.0
 
+# Install the CURRENT tree's nemo_gym into the OpenHands venv.
+#
+# The agent running inside the sandbox imports nemo_gym from THIS venv, not from
+# the Gym tree. Left to pip's own resolution the venv can end up with a stale
+# nemo_gym that predates the ServerClient self-heal (bounded connection retries +
+# re-resolving a server's address from the head server when a connect fails).
+# Without the heal, a policy-server port rebind makes every agent retry a dead
+# address 3x and return an EMPTY trajectory -- 128 empty rollouts then kill the
+# job at prepare_trajectories with no obvious cause (observed 2026-07-25).
+_NG_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+if [ -d "$_NG_SRC/nemo_gym" ]; then
+    echo "Syncing nemo_gym from tree ($_NG_SRC) into the OpenHands venv..."
+    poetry run python -m pip install -q --no-deps --force-reinstall "$_NG_SRC" \
+        || cp -f "$_NG_SRC"/nemo_gym/*.py "$(poetry run python -c 'import nemo_gym,os;print(os.path.dirname(nemo_gym.__file__))')/" \
+        || echo "WARNING: could not sync nemo_gym into the venv"
+fi
+
 mkdir -p evaluation/oh
 mkdir -p logs
 mkdir -p .eval_sessions
