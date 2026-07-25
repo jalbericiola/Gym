@@ -174,7 +174,13 @@ poetry install --no-interaction --no-root
 # Install datasets package
 echo "Installing datasets package..."
 
-poetry run python -m pip install datasets huggingface_hub packaging==26.0
+# wandb: evaluation/utils/shared.py imports it while recording results. If it is
+# missing every episode raises 'No module named wandb', exhausts its retries and
+# returns an EMPTY trajectory -- the agent does all its real work (edits, test
+# runs) and then the harness dies on the import, so 128 rollouts come back empty
+# and the job dies at prepare_trajectories (observed 2026-07-25 after a clean
+# rebuild; the previous long-lived setup happened to have it installed).
+poetry run python -m pip install datasets huggingface_hub packaging==26.0 wandb
 
 # Install the CURRENT tree's nemo_gym into the OpenHands venv.
 #
