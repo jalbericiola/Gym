@@ -180,7 +180,18 @@ echo "Installing datasets package..."
 # runs) and then the harness dies on the import, so 128 rollouts come back empty
 # and the job dies at prepare_trajectories (observed 2026-07-25 after a clean
 # rebuild; the previous long-lived setup happened to have it installed).
-poetry run python -m pip install datasets huggingface_hub packaging==26.0 wandb
+# Resolve the venv interpreter explicitly and use it for every install below.
+# `poetry run python` is not reliable here (see the nemo_gym note further down).
+_NG_VENV_PY="$(pwd)/.venv/bin/python"
+if [ ! -x "$_NG_VENV_PY" ]; then
+    _NG_VENV_PY="$(poetry env info --path 2>/dev/null)/bin/python"
+fi
+if [ ! -x "$_NG_VENV_PY" ]; then
+    echo "FATAL: cannot locate the OpenHands venv interpreter" >&2; exit 1
+fi
+echo "OpenHands venv interpreter: $_NG_VENV_PY"
+
+"$_NG_VENV_PY" -m pip install datasets huggingface_hub packaging==26.0 wandb
 
 # Install the CURRENT tree's nemo_gym into the OpenHands venv.
 #
@@ -191,12 +202,28 @@ poetry run python -m pip install datasets huggingface_hub packaging==26.0 wandb
 # Without the heal, a policy-server port rebind makes every agent retry a dead
 # address 3x and return an EMPTY trajectory -- 128 empty rollouts then kill the
 # job at prepare_trajectories with no obvious cause (observed 2026-07-25).
+# This MUST be all-or-nothing. An earlier version ran `pip install -q ... || cp
+# *.py || echo WARNING`: pip did not target this venv, `-q` hid the error, and the
+# cp fallback landed only part of the package. That left a NEW global_config.py
+# against an OLD __init__.py, so every episode died on
+#   ImportError: cannot import name 'WORKING_DIR' from 'nemo_gym'
+# before doing any work -- strictly worse than the stale-but-coherent package it
+# replaced (observed 2026-07-25). Hence: the venv's own interpreter (not
+# `poetry run`, which resolved elsewhere), no -q, no fallback, and a hard
+# post-install import check that fails the setup rather than shipping a half
+# package.
 _NG_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-if [ -d "$_NG_SRC/nemo_gym" ]; then
+if [ -d "$_NG_SRC/nemo_gym" ] && [ -x "$_NG_VENV_PY" ]; then
     echo "Syncing nemo_gym from tree ($_NG_SRC) into the OpenHands venv..."
-    poetry run python -m pip install -q --no-deps --force-reinstall "$_NG_SRC" \
-        || cp -f "$_NG_SRC"/nemo_gym/*.py "$(poetry run python -c 'import nemo_gym,os;print(os.path.dirname(nemo_gym.__file__))')/" \
-        || echo "WARNING: could not sync nemo_gym into the venv"
+    "$_NG_VENV_PY" -m pip install --no-deps --force-reinstall --no-cache-dir "$_NG_SRC" || {
+        echo "FATAL: nemo_gym install into the OpenHands venv failed" >&2; exit 1; }
+    "$_NG_VENV_PY" - <<'PYCHK' || { echo "FATAL: nemo_gym in the OpenHands venv is inconsistent" >&2; exit 1; }
+from nemo_gym import CACHE_DIR, PARENT_DIR, RESULTS_DIR, WORKING_DIR
+from nemo_gym.global_config import get_global_config_dict
+print("nemo_gym venv sync verified")
+PYCHK
+else
+    echo "FATAL: cannot sync nemo_gym (src=$_NG_SRC venv_py=$_NG_VENV_PY)" >&2; exit 1
 fi
 
 mkdir -p evaluation/oh
