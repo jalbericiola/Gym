@@ -74,5 +74,17 @@ swe_agents_train:
       datasets:
         - name: train
           type: train
-          jsonl_fpath: /lustre/fsw/portfolios/llmservice/users/sdevare/repos/ultra/datasets/swe/blends/large_root_cause_curriculum_with_mercor_ots_plus_singlefile_swerebench_overlap_fix.jsonl
+          # THIS key selects the prompt stream (nemo_gym/train_data_utils.py reads
+          # datasets[].jsonl_fpath); `dataset_path` above has NO consumer in this
+          # gym tree -- our clone is NVIDIA-NeMo/Gym + the local "swe-parity-port:
+          # pjin scaffold" commit, not pjin's gitlab branch
+          # (pjin/ultra-v3-clean-merge-swe-dev-20260630) where that field is wired.
+          # So setting dataset_path alone did NOT change what we train on: runs
+          # reported dataset_size=9262 = sdevare's blend, and scored a flat 0.
+          # pjin's config sets BOTH keys to the nano-bear file and comments out
+          # sdevare's blend; match that here so the two agree.
+          # nano-bear is ORDERED: metadata.pass_rate averages 0.567 over the first
+          # 500 rows and 0.0 thereafter, so the curriculum must consume the HEAD
+          # for a nonzero reward to be possible at all.
+          jsonl_fpath: /lustre/fsw/portfolios/llmservice/users/pjin/data/swe/nano-bear-mixed-then-allzero-by-patchsize.jsonl
           license: Apache 2.0
