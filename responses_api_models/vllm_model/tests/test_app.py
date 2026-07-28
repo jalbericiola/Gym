@@ -57,6 +57,7 @@ from responses_api_models.vllm_model.app import (
     VLLMConverter,
     VLLMModel,
     VLLMModelConfig,
+    _normalized_training_metadata,
 )
 
 
@@ -1586,6 +1587,51 @@ class TestApp:
         data = response_2_2.json()
         assert data["output"][0]["content"][0]["text"] == "2"
 
+    def test_endpoint_file_rebinds_clients(self, tmp_path):
+        endpoint_file = tmp_path / "endpoint.txt"
+        endpoint_file.write_text("http://new-host:8712/v1\n")
+        config = VLLMModelConfig(
+            host="0.0.0.0",
+            port=8081,
+            base_url="http://placeholder:8712/v1",
+            api_key="dummy_key",  # pragma: allowlist secret
+            model="dummy_model",
+            entrypoint="",
+            name="safety_judge_model",
+            return_token_id_information=False,
+            uses_reasoning_parser=False,
+            endpoint_file=str(endpoint_file),
+        )
+        server = VLLMModel(config=config, server_client=MagicMock(spec=ServerClient))
+
+        server._maybe_rebind_endpoint()
+
+        assert server.config.base_url == ["http://new-host:8712/v1"]
+        assert len(server._clients) == 1
+        assert server._clients[0].base_url == "http://new-host:8712/v1"
+        assert server._clients[0].max_connection_retries == 120
+
+    def test_missing_endpoint_file_keeps_last_client(self, tmp_path):
+        endpoint_file = tmp_path / "missing-endpoint.txt"
+        config = VLLMModelConfig(
+            host="0.0.0.0",
+            port=8081,
+            base_url="http://last-good:8712/v1",
+            api_key="dummy_key",  # pragma: allowlist secret
+            model="dummy_model",
+            entrypoint="",
+            name="safety_judge_model",
+            return_token_id_information=False,
+            uses_reasoning_parser=False,
+            endpoint_file=str(endpoint_file),
+        )
+        server = VLLMModel(config=config, server_client=MagicMock(spec=ServerClient))
+
+        server._maybe_rebind_endpoint()
+
+        assert server.config.base_url == ["http://last-good:8712/v1"]
+        assert server._clients[0].base_url == "http://last-good:8712/v1"
+
     def test_responses_reasoning_parser(self, monkeypatch: MonkeyPatch):
         server = self._setup_server(monkeypatch)
         server.config.uses_reasoning_parser = True
@@ -2577,6 +2623,19 @@ class TestVLLMConverter:
     def setup_method(self, _):
         self.converter = VLLMConverter(return_token_id_information=False)
 
+    def test_normalizes_null_training_metadata(self) -> None:
+        assert _normalized_training_metadata(
+            {
+                "policy_epoch": [None],
+                "kv_cache_epoch": [None],
+                "num_evictions": [None],
+            }
+        ) == {
+            "policy_epoch": [[(0, 0)]],
+            "kv_cache_epoch": [[(0, 0)]],
+            "num_evictions": [0],
+        }
+
     def test_responses_input_types_EasyInputMessageParam(self) -> None:
         """
         Tests the conversion of ResponseCreateParams to ChatCompletionCreateParams
@@ -2934,6 +2993,9 @@ class TestVLLMConverter:
             prompt_token_ids=[1, 2, 3],
             generation_token_ids=[4, 5, 6],
             generation_log_probs=[7.0, 8.0, 9.0],
+            policy_epoch=[[(0, 0)]],
+            kv_cache_epoch=[[(0, 0)]],
+            num_evictions=[0],
         )
         actual_response_output_items = converter.postprocess_chat_response(
             choice=NeMoGymChoice(
@@ -2992,6 +3054,9 @@ class TestVLLMConverter:
                 prompt_token_ids=[1, 2, 3],
                 generation_token_ids=[4, 5, 6],
                 generation_log_probs=[7.0, 8.0, 9.0],
+                policy_epoch=[[(0, 0)]],
+                kv_cache_epoch=[[(0, 0)]],
+                num_evictions=[0],
             ),
         ]
         assert expected_messages == actual_messages

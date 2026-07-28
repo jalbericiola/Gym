@@ -20,6 +20,7 @@ import random
 import re
 import shlex
 import shutil
+import signal
 import sys
 import time
 import uuid
@@ -122,6 +123,15 @@ class SWEBenchWrapperConfig(BaseResponsesAPIAgentConfig):
 
     # Concurrency control
     concurrency: int = Field(default=256, description="Maximum number of concurrent SWE-bench runs")
+    ray_num_cpus_per_worker: float = Field(
+        default=1.0,
+        gt=0,
+        description="Ray CPU resources reserved by each SWE episode",
+    )
+    preserve_episode_artifacts: bool = Field(
+        default=False,
+        description="Keep successful per-episode scratch directories for diagnostics",
+    )
 
     dataset_path: Optional[str] = Field(
         default=None,
@@ -226,6 +236,8 @@ class SWEBenchMetrics(BaseModel):
     resolved: Optional[bool] = None
     patch_exists: Optional[bool] = None
     model_patch: Optional[str] = None
+    mask_sample: bool = False
+    failure_reason: Optional[str] = None
 
     # Failure-mode signals used to decide mask_sample downstream.
     # agent_error_kind is one of: "max_iteration", "context_window",
@@ -537,6 +549,28 @@ EVAL_HARNESS_COMMIT={eval_harness_commit} \\
         )
 
 
+def _serialize_nv_internal_jest(run_script: str) -> str:
+    """Avoid large Jest worker pools that can wedge rootless Apptainer FUSE."""
+
+    serialized_lines = []
+    for line in run_script.splitlines(keepends=True):
+        if re.search(r"\b(?:npx|yarn)\s+jest\b", line):
+            flags = []
+            if "--runInBand" not in line and "--maxWorkers" not in line:
+                flags.append("--runInBand")
+            if "--forceExit" not in line:
+                flags.append("--forceExit")
+            if flags:
+                line = re.sub(
+                    r"(\b(?:npx|yarn)\s+jest\b)",
+                    rf"\1 {' '.join(flags)}",
+                    line,
+                    count=1,
+                )
+        serialized_lines.append(line)
+    return "".join(serialized_lines)
+
+
 class NVInternalDatasetProcessor(BaseDatasetHarnessProcessor):
     def get_run_command(self) -> ExecuteContainerCommandArgs:
         instance_dict = json.loads(self.config.problem_info["instance_dict"])
@@ -579,14 +613,16 @@ class NVInternalDatasetProcessor(BaseDatasetHarnessProcessor):
         else:
             test_files = ",".join(test_files_str)
 
-        run_script = instance_dict["run_script.sh"]
+        run_script = _serialize_nv_internal_jest(instance_dict["run_script.sh"])
         parsing_script = instance_dict["parsing_script.py"]
         run_script_path = self.config.persistent_dir / "run_script.sh"
         parsing_script_path = self.config.persistent_dir / "parsing_script.py"
+        test_patch_path = self.config.persistent_dir / "test_patch.diff"
         with open(run_script_path, "w") as f:
             f.write(run_script)
         with open(parsing_script_path, "w") as f:
             f.write(parsing_script)
+        test_patch_path.write_text(instance_dict.get("test_patch", ""))
 
         cmd = f"""#!/bin/bash
 set -e
@@ -601,6 +637,9 @@ date +\"%s.%N\" > {self.config.final_eval_apptainer_spinup_timestamp_mounted_fpa
 cd /app
 git reset --hard {instance_dict.get("base_commit", "")}
 git checkout {instance_dict.get("base_commit", "")}
+
+# Restore hidden evaluation tests after resetting to the task base commit.
+git apply --ignore-space-change --ignore-whitespace --reject -v /root/test_patch.diff || true
 
 # Apply patch with rejection to handle conflicts
 git apply --ignore-space-change --ignore-whitespace --reject -v /root/patch.diff || true
@@ -1247,6 +1286,10 @@ AGENT_FRAMEWORK_COMMIT={self.config.agent_framework_commit} \\
             "chown $uid:$uid /tmp/tmux-$uid || true && "
             "chmod 700 /tmp/tmux-$uid && "
             "tmux -S /tmp/tmux-$uid/default start-server || true && "
+            # A model can leave a command running in the local-runtime tmux pane
+            # when it reaches max iterations. run_infer then exits, but that tmux
+            # server keeps `apptainer exec` alive until the outer agent timeout.
+            "trap 'tmux -S /tmp/tmux-$uid/default kill-server 2>/dev/null || true' EXIT && "
             "cp /openhands_setup/miniforge3/bin/jq /usr/local/bin/jq 2>/dev/null || true && "
             # Use pre-built OpenHands
             "cd /openhands_setup/OpenHands && "
@@ -1270,7 +1313,9 @@ AGENT_FRAMEWORK_COMMIT={self.config.agent_framework_commit} \\
             f"{camel_case_tool_names_cmd}"
             f"echo {shlex.quote(config_str)} >{config_file_path} && "
             # f" export EVAL_OUTPUT_DIR={eval_dir_in_openhands} && "
-            f"./evaluation/benchmarks/swe_bench/scripts/run_infer.sh "
+            # Keep a PID-1 wrapper after run_infer so failed finalization cannot
+            # leave its last tmux command holding the Apptainer namespace open.
+            f"set +e; ./evaluation/benchmarks/swe_bench/scripts/run_infer.sh "
             f"    llm.model "  # name of llm config section in config.toml
             f"    {self.config.agent_framework_commit} "  # openhands commit
             f"    {self.config.resolved_agent_cls} "  # agent
@@ -1290,6 +1335,18 @@ AGENT_FRAMEWORK_COMMIT={self.config.agent_framework_commit} \\
         if self.config.resolved_user_prompt_template is not None:
             agent_main_cmd += "    /openhands_setup/OpenHands/system_prompt.j2 "
             agent_main_cmd += "    /openhands_setup/OpenHands/system_prompt_long_horizon.j2 "
+
+        agent_main_cmd += (
+            "\n_agent_rc=$?\n"
+            f"if ! find {shlex.quote(eval_dir_in_openhands)} -type f -name output.jsonl "
+            "-print -quit | grep -q .; then\n"
+            # With --no-init this wrapper is PID 1. SIGKILL tears down every
+            # remaining process in the episode namespace, including commands
+            # stuck after OpenHands failed to collect a final observation.
+            "    kill -KILL $$\n"
+            "fi\n"
+            "exit $_agent_rc\n"
+        )
 
         agent_script_name = f"agent_script_{agent_run_id}.sh"
         agent_script_path = self.config.persistent_dir / agent_script_name
@@ -1338,12 +1395,25 @@ def _classify_agent_error(err: Optional[str]) -> Optional[str]:
     return "other"
 
 
+def _extract_golden_patch(dataset_name: str, instance_dict: Dict[str, Any]) -> str:
+    patch_key = {
+        "swe-bench-ext": "patch",
+        "nv-internal-1": "gold_patch",
+    }.get(dataset_name)
+    if patch_key is None:
+        raise NotImplementedError(f"verify_golden_patch is not supported for dataset_name={dataset_name!r}")
+
+    golden_patch = instance_dict.get(patch_key) or ""
+    if not golden_patch.strip():
+        raise ValueError(f"No golden patch found in instance_dict[{patch_key!r}]")
+    return golden_patch if golden_patch.endswith("\n") else golden_patch + "\n"
+
+
 @ray.remote(
     scheduling_strategy="SPREAD",
     runtime_env={
         "py_executable": sys.executable,
     },
-    num_cpus=0.1,
 )
 def runner_ray_remote(params_dict: dict[str, Any]) -> Optional[Path]:
     # For some reason Ray may not pick up the proper model fields if we don't rebuild the model here. Very strange.
@@ -1378,6 +1448,11 @@ class ActiveContainerCommand(BaseModel):
     process: Process
     log_file: Any
     log_file_path: Path
+
+
+_CONTAINER_COMMAND_POLL_INTERVAL_S = 5.0
+_OPENHANDS_COMPLETION_MARKER = "Instances processed: 100%"
+_OPENHANDS_OUTPUT_GRACE_S = 60.0
 
 
 class RunOpenHandsAgent(BaseModel):
@@ -1436,27 +1511,84 @@ class RunOpenHandsAgent(BaseModel):
         log_file_path = logs_dir / f"{self.config.instance_id}_{command.mode}.log"
         log_file = open(log_file_path, "w")
 
-        process = await asyncio.create_subprocess_shell(apptainer_cmd, stdout=log_file, stderr=log_file)
+        process = await asyncio.create_subprocess_shell(
+            apptainer_cmd,
+            stdout=log_file,
+            stderr=log_file,
+            start_new_session=True,
+        )
 
         return ActiveContainerCommand(process=process, log_file=log_file, log_file_path=log_file_path)
+
+    async def _terminate_process_group(self, active_command: ActiveContainerCommand) -> None:
+        if active_command.process.returncode is not None:
+            return
+
+        try:
+            os.killpg(active_command.process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            active_command.process.kill()
+
+        try:
+            await asyncio.wait_for(active_command.process.wait(), timeout=30)
+        except asyncio.TimeoutError:
+            pass
 
     async def _finish_container_command(
         self, active_command: ActiveContainerCommand, command: ExecuteContainerCommandArgs
     ) -> str:
         data_point = self.config.problem_info
+        terminated_after_completion = False
+        completion_marker_seen_at: Optional[float] = None
 
         try:
-            # Wait for completion with timeout
-            await asyncio.wait_for(active_command.process.communicate(), timeout=command.timeout)
+            deadline = asyncio.get_running_loop().time() + command.timeout
+            while active_command.process.returncode is None:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                try:
+                    await asyncio.wait_for(
+                        active_command.process.wait(),
+                        timeout=min(_CONTAINER_COMMAND_POLL_INTERVAL_S, remaining),
+                    )
+                except asyncio.TimeoutError:
+                    if command.mode != "agent":
+                        continue
+
+                    active_command.log_file.flush()
+                    log_text = active_command.log_file_path.read_text(errors="replace")
+                    if _OPENHANDS_COMPLETION_MARKER in log_text:
+                        now = asyncio.get_running_loop().time()
+                        if completion_marker_seen_at is None:
+                            completion_marker_seen_at = now
+                        pred_files = glob.glob(command.expected_file_pattern, recursive=True)
+                        complete_pred_files = []
+                        for pred_file in pred_files:
+                            try:
+                                json.loads(Path(pred_file).read_text().strip())
+                                complete_pred_files.append(pred_file)
+                            except (OSError, json.JSONDecodeError):
+                                continue
+                        if complete_pred_files:
+                            await self._terminate_process_group(active_command)
+                            terminated_after_completion = True
+                            break
+                        if now - completion_marker_seen_at >= _OPENHANDS_OUTPUT_GRACE_S:
+                            await self._terminate_process_group(active_command)
+                            raise RuntimeError(
+                                "OpenHands finished without output or with incomplete output; "
+                                "terminated its lingering container process group"
+                            )
         except asyncio.TimeoutError:
-            if active_command.process.returncode is None:
-                active_command.process.kill()
-                await active_command.process.wait()
+            await self._terminate_process_group(active_command)
             raise ValueError("Command timed out")
         finally:
             active_command.log_file.close()
 
-        if active_command.process.returncode != 0:
+        if active_command.process.returncode != 0 and not terminated_after_completion:
             raise RuntimeError(
                 f"Command failed with return code {active_command.process.returncode}. "
                 f"Logs:\n{active_command.log_file_path.read_text(errors='replace')}"
@@ -1482,10 +1614,9 @@ class RunOpenHandsAgent(BaseModel):
             )
 
     async def _kill_active_command(self, active_command: ActiveContainerCommand) -> None:
-        if active_command.process.returncode is None:
-            active_command.process.kill()
-            await active_command.process.wait()
-        active_command.log_file.close()
+        await self._terminate_process_group(active_command)
+        if not active_command.log_file.closed:
+            active_command.log_file.close()
 
     async def process_single_datapoint(self) -> Optional[Path]:
         if self.config.verify_golden_patch:
@@ -1523,6 +1654,9 @@ class RunOpenHandsAgent(BaseModel):
             await self._kill_active_command(eval_active_command)
             metrics.openhands_run_time += time.time()
             metrics.patch_exists = False
+            metrics.mask_sample = True
+            metrics.failure_reason = "agent_command_failure"
+            metrics.agent_error_kind = "other"
             metrics.final_eval_apptainer_spinup_time = None
             # Detect wall-clock agent timeout: openhands_run_time (elapsed since start)
             # reached or exceeded the configured swebench_agent_timeout.
@@ -1628,21 +1762,8 @@ class RunOpenHandsAgent(BaseModel):
     async def _run_golden_patch_verification(self) -> Optional[Path]:
         instance_id = self.config.instance_id
         dataset_name = self.config.problem_info.get("dataset_name")
-        #TODO(sugam): add support for other datasets
-        if dataset_name != "swe-bench-ext":
-            raise NotImplementedError(
-                f"verify_golden_patch is only supported for dataset_name=='swe-bench-ext' "
-                f"(got {dataset_name!r})."
-            )
-
         instance_dict = json.loads(self.config.problem_info["instance_dict"])
-        golden_patch = instance_dict.get("patch") or ""
-        if not golden_patch.strip():
-            raise ValueError(
-                f"No golden patch found in instance_dict['patch'] for {instance_id}."
-            )
-        if not golden_patch.endswith("\n"):
-            golden_patch += "\n"
+        golden_patch = _extract_golden_patch(dataset_name, instance_dict)
 
         metrics = SWEBenchMetrics(ray_queue_time=time.time() - self.config.ray_queue_timestamp)
         metrics.model_patch = golden_patch
@@ -1944,12 +2065,14 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
         if command.mode == "eval" and data_point["dataset_name"] == "nv-internal-1":
             run_script_path = params.persistent_dir / "run_script.sh"
             parsing_script_path = params.persistent_dir / "parsing_script.py"
+            test_patch_path = params.persistent_dir / "test_patch.diff"
 
             # Placeholder needed: eval container starts before agent writes the patch
             params.model_patch_path.write_text("")
 
             mount_args.append(f"--mount type=bind,src={run_script_path},dst=/root/run_script.sh")
             mount_args.append(f"--mount type=bind,src={parsing_script_path},dst=/root/parsing_script.py")
+            mount_args.append(f"--mount type=bind,src={test_patch_path},dst=/root/test_patch.diff,ro")
             mount_args.append(f"--mount type=bind,src={params.model_patch_path},dst=/root/patch.diff")
 
         if command.mode == "eval" and "R2E-Gym" in data_point["dataset_name"]:
@@ -2018,7 +2141,10 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
 
         # Launch Apptainer container and execute the script file
         apptainer_cmd = (
-            f"apptainer exec --writable-tmpfs --cleanenv --pid --no-mount home,tmp,bind-paths "
+            # Make the episode script PID 1. When it exits, the kernel terminates
+            # any command orphaned by OpenHands instead of leaving Apptainer's
+            # init shim waiting indefinitely for that process.
+            f"apptainer exec --writable-tmpfs --cleanenv --pid --no-init --no-mount home,tmp,bind-paths "
             f"{env_args}"
             f"{mount_str} "
             f" {params.container} bash {container_script_path}"
@@ -2183,13 +2309,16 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
         # Failed episodes keep their dir (traceback.err forensics); the launcher's
         # aged-dir sweeper bounds those. Re-grafted after the upstream refactor
         # dropped it (swe-parity-port review 2026-07-22).
-        rmtree(params.persistent_dir, ignore_errors=True)
+        if not params.preserve_episode_artifacts:
+            rmtree(params.persistent_dir, ignore_errors=True)
         return response
 
     async def _inner_responses(
         self, params: SWEBenchWrapperInstanceConfig, dataset_processor: BaseDatasetHarnessProcessor
     ) -> NeMoGymResponse:
-        maybe_report_file = await runner_ray_remote.remote(params.model_dump())
+        maybe_report_file = await runner_ray_remote.options(
+            num_cpus=params.ray_num_cpus_per_worker
+        ).remote(params.model_dump())
         metrics_to_update = dict()
 
         if maybe_report_file:
@@ -2230,12 +2359,23 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
         agent_error_kind = persisted_metrics.agent_error_kind
         eval_timed_out = bool(persisted_metrics.eval_timed_out)
         agent_timed_out = bool(persisted_metrics.agent_timed_out)
+        failure_reason = persisted_metrics.failure_reason
         if (
-            (resolved_now and agent_error_kind in ("max_iteration", "context_window"))
+            persisted_metrics.mask_sample
+            or (resolved_now and agent_error_kind in ("max_iteration", "context_window"))
             or eval_timed_out
             or agent_timed_out
         ):
             params.mask_sample = True
+            if not failure_reason:
+                if agent_timed_out:
+                    failure_reason = "agent_timeout"
+                elif eval_timed_out:
+                    failure_reason = "eval_timeout"
+                else:
+                    failure_reason = f"agent_{agent_error_kind}"
+        metrics_to_update["mask_sample"] = params.mask_sample
+        metrics_to_update["failure_reason"] = failure_reason
 
         trajectories_dir = params.persistent_dir / "trajectories"
         chat_completions_trajectory, chat_completions_tools = self.get_openhands_trajectory_from_completions(

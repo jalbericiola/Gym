@@ -25,6 +25,7 @@ from app import (
     CompCodingVerifyResponse,
 )
 from fastapi.testclient import TestClient
+from lcb_integration.testing_util import MockStdinWithBuffer
 from pydantic import ValidationError
 
 from nemo_gym.base_resources_server import AggregateMetricsRequest
@@ -34,6 +35,12 @@ from nemo_gym.server_utils import ServerClient
 
 
 class TestApp:
+    def test_mock_stdin_supports_iteration(self) -> None:
+        assert list(MockStdinWithBuffer("first\nsecond\n")) == [
+            "first\n",
+            "second\n",
+        ]
+
     @pytest.fixture(scope="module")
     def code_gen_resources_server_client(self) -> Generator[TestClient, None, None]:
         ray.init(num_cpus=1)

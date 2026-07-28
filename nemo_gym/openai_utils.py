@@ -480,6 +480,10 @@ class NeMoGymAsyncOpenAI(BaseModel):  # pragma: no cover
         default=False,
         description="Set this to true if this particular client is only used to call internal NeMo Gym servers.",
     )
+    max_connection_retries: Optional[int] = Field(
+        default=None,
+        description="Bound connection retries so callers can refresh a rotated endpoint.",
+    )
 
     async def _request(self, **request_kwargs: Dict) -> ClientResponse:
         request_kwargs = request_kwargs | {
@@ -487,6 +491,7 @@ class NeMoGymAsyncOpenAI(BaseModel):  # pragma: no cover
                 "Authorization": f"Bearer {self.api_key}",
             },
             "_internal": self.internal,
+            "_max_connection_retries": self.max_connection_retries,
         }
 
         max_num_tries = MAX_NUM_TRIES

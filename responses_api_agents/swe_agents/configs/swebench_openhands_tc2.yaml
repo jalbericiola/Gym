@@ -2,10 +2,9 @@
 # (wandb nvidia/ultra-v3-swe-e2e/2c6rxuvr, sdevare nemo-rl-mopd, 2026-05-30).
 # Derived from swebench_openhands_hsg.yaml with the reference's agent knobs:
 #   agent_max_turns 200 (reference; needs SL 196608 + CP8 to fit),
-#   swebench_agent_timeout 3600 (reference),
-#   swebench_tests_timeout 2700 (DELIBERATE deviation: reference runs 900s,
-#     which zeroed ~15% of our rewards on slow/non-Python repos - Jul-5 audit),
-#   apptainer_memory_limit_mb 65536, concurrency 1024 (reference),
+#   swebench_agent_timeout 3600 (original reference; configurable below),
+#   swebench_tests_timeout 900,
+#   apptainer_memory_limit_mb 65536, concurrency 1024 across 64 nodes,
 #   agent_prompt_override_random true (= reference run_with_mixed_prompts),
 #   container_formatter = reference's exact 6 sources + our extra mirrors,
 #   dataset = the reference training blend (root-cause curriculum + mercor OTS
@@ -21,7 +20,7 @@ swe_agents_train:
       value: Improve agentic software engineering capabilities.
       agent_framework: openhands
       agent_config: responses_api_agents/swe_agents/configs/oh_config.toml
-      agent_max_turns: 200
+      agent_max_turns: ${oc.env:SWE_AGENT_MAX_TURNS,200}
       # DIAGNOSTIC (2026-07-25): runs default to LOG_LEVEL=CRITICAL, which hides the
       # agent's own HTTP errors. Episodes are failing with httpx ConnectError
       # [Errno 111] Connection refused and we cannot see WHICH url they dial.
@@ -46,7 +45,10 @@ swe_agents_train:
         - /lustre/fsw/portfolios/llmservice/users/sdevare/images/swebench/swe-bench.eval.arm64.{instance_id}.sif
         - /lustre/fsw/portfolios/llmservice/users/sdevare/images/mercor/swebenchpro_ots/{instance_id}.sif
       container_folder_path: null
-      swebench_agent_timeout: 2700   # pjin exact
+      # The historical pass-rate labels were produced with a 3600-second
+      # budget. Production may choose 2700 after the parity canary, but the
+      # positive control must be able to restore the original budget.
+      swebench_agent_timeout: ${oc.env:SWE_AGENT_TIMEOUT,2700}
       swebench_tests_timeout: 900    # pjin exact
       apptainer_memory_limit_mb: 65536
       command_exec_timeout: 300
@@ -56,7 +58,13 @@ swe_agents_train:
       # into gym.log: canary 5601247 wrote 5.2GB (~1MB/s, 60MB per 62s of wall
       # clock) onto Lustre. Turn it on deliberately and briefly, never by default.
       openhands_should_log: false
-      concurrency: 512  # nproc raise (launcher) is the real fix for worker-startup; 128 was over-conservative -> waves too slow to bank within a 3h40 link (canary 5574009 exited mid-straggler). 512 = ~40min waves, straggler margin, under 1024 memory pressure.
+      # Keep successful episode artifacts only for targeted diagnostics.
+      preserve_episode_artifacts: ${oc.env:SWE_PRESERVE_EPISODES,false}
+      verify_golden_patch: ${oc.env:SWE_VERIFY_GOLDEN_PATCH,false}
+      # Ray previously admitted ten heavyweight episodes per advertised CPU.
+      # One CPU/task plus a node-scaled semaphore provides real backpressure.
+      ray_num_cpus_per_worker: ${oc.env:SWE_RAY_NUM_CPUS,1.0}
+      concurrency: ${oc.env:SWE_CONCURRENCY,64}
       # pjin's exact training dataset (their config, verified 2026-07-24). NOTE the
       # name: 'mixed-then-allzero-by-patchsize' -- it is ORDERED, mixed rows first
       # then an all-zero-reward tail. With NEMOGYM_CURRICULUM=1 we read from the

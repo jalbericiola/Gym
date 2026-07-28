@@ -213,6 +213,8 @@ class TestSWEBenchWrapperConfig:
         assert config.apptainer_memory_limit_mb == 32 * 1024
         assert config.command_exec_timeout == 5 * 60
         assert config.concurrency == 256
+        assert config.ray_num_cpus_per_worker == 1.0
+        assert config.preserve_episode_artifacts is False
         assert config.dataset_path is None
         assert config.agent_prompt_overrides is None
         assert config.agent_prompt_override_random is False
@@ -476,6 +478,7 @@ class TestNVInternalDatasetProcessor:
             "selected_test_files_to_run": '["test_a.py", "test_b.py"]',
             "run_script.sh": "#!/bin/bash\npytest $1",
             "parsing_script.py": "import sys\nprint('done')",
+            "test_patch": "diff --git a/test_a.py b/test_a.py\n",
             "base_commit": "abc123",
         }
         if instance_dict_override:
@@ -502,7 +505,8 @@ class TestNVInternalDatasetProcessor:
             assert isinstance(result, ExecuteContainerCommandArgs)
             assert result.mode == "eval"
             assert "git reset --hard abc123" in result.command
-            assert "git apply" in result.command
+            assert "/root/test_patch.diff" in result.command
+            assert (processor.config.persistent_dir / "test_patch.diff").exists()
             assert "run_script.sh" in result.command
             assert "parsing_script.py" in result.command
 
@@ -837,7 +841,11 @@ class TestOpenHandsHarnessProcessor:
             assert isinstance(result, ExecuteContainerCommandArgs)
             assert result.mode == "agent"
             assert "timeout" in result.command
-            assert "run_infer.sh" in self._read_agent_script(config)
+            agent_script = self._read_agent_script(config)
+            assert "run_infer.sh" in agent_script
+            assert "trap 'tmux -S /tmp/tmux-$uid/default kill-server" in agent_script
+            assert "set +e; ./evaluation/benchmarks/swe_bench/scripts/run_infer.sh" in agent_script
+            assert "kill -KILL $$" in agent_script
 
     def _read_agent_script(self, config) -> str:
         # The script is written at persistent_dir / agent_script_{agent_run_id}.sh
@@ -934,6 +942,34 @@ class TestOpenHandsHarnessProcessor:
 ########################################
 # runner_ray_remote tests
 ########################################
+
+
+class TestGoldenPatchExtraction:
+    def test_nv_internal_uses_gold_patch(self) -> None:
+        assert swe_app._extract_golden_patch("nv-internal-1", {"gold_patch": "diff"}) == "diff\n"
+
+    def test_swebench_ext_uses_patch(self) -> None:
+        assert swe_app._extract_golden_patch("swe-bench-ext", {"patch": "diff\n"}) == "diff\n"
+
+    def test_unsupported_dataset(self) -> None:
+        with pytest.raises(NotImplementedError):
+            swe_app._extract_golden_patch("unknown", {"patch": "diff"})
+
+
+class TestNVInternalJestSerialization:
+    def test_adds_run_in_band(self) -> None:
+        script = "npx jest --verbose\nyarn jest path/to/test.js\n"
+        assert swe_app._serialize_nv_internal_jest(script) == (
+            "npx jest --runInBand --forceExit --verbose\n"
+            "yarn jest --runInBand --forceExit path/to/test.js\n"
+        )
+
+    def test_preserves_existing_worker_limit(self) -> None:
+        script = "npx jest --runInBand test.js\nyarn jest --maxWorkers=2 test.js\n"
+        assert swe_app._serialize_nv_internal_jest(script) == (
+            "npx jest --forceExit --runInBand test.js\n"
+            "yarn jest --forceExit --maxWorkers=2 test.js\n"
+        )
 
 
 class TestRunnerRayRemote:
@@ -1125,6 +1161,81 @@ class TestRunOpenHandsAgent:
                 await agent._finish_container_command(active, cmd)
 
     @pytest.mark.asyncio
+    async def test_finish_agent_marker_kills_lingering_process(self, monkeypatch) -> None:
+        monkeypatch.setattr(swe_app, "_CONTAINER_COMMAND_POLL_INTERVAL_S", 0.05)
+        monkeypatch.setattr(swe_app, "_OPENHANDS_OUTPUT_GRACE_S", 0.1)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            agent = self._make_agent(tmpdir)
+            agent.config.persistent_dir.mkdir(parents=True, exist_ok=True)
+
+            cmd = ExecuteContainerCommandArgs(
+                command="agent",
+                expected_file_pattern=str(Path(tmpdir) / "missing-output.jsonl"),
+                mode="agent",
+                timeout=10,
+            )
+            active = await agent._start_container_command(
+                cmd,
+                "printf 'Instances processed: 100%%\\n'; sleep 100",
+            )
+            with pytest.raises(RuntimeError, match="finished without output"):
+                await agent._finish_container_command(active, cmd)
+            assert active.process.returncode is not None
+
+    @pytest.mark.asyncio
+    async def test_finish_agent_marker_returns_existing_output(self, monkeypatch) -> None:
+        monkeypatch.setattr(swe_app, "_CONTAINER_COMMAND_POLL_INTERVAL_S", 0.05)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            agent = self._make_agent(tmpdir)
+            agent.config.persistent_dir.mkdir(parents=True, exist_ok=True)
+            expected_file = Path(tmpdir) / "output.jsonl"
+            expected_file.write_text("{}")
+
+            cmd = ExecuteContainerCommandArgs(
+                command="agent",
+                expected_file_pattern=str(expected_file),
+                mode="agent",
+                timeout=10,
+            )
+            active = await agent._start_container_command(
+                cmd,
+                "printf 'Instances processed: 100%%\\n'; sleep 100",
+            )
+            result = await agent._finish_container_command(active, cmd)
+            assert result == str(expected_file)
+            assert active.process.returncode is not None
+
+    @pytest.mark.asyncio
+    async def test_finish_agent_marker_waits_for_complete_output(self, monkeypatch) -> None:
+        monkeypatch.setattr(swe_app, "_CONTAINER_COMMAND_POLL_INTERVAL_S", 0.05)
+        monkeypatch.setattr(swe_app, "_OPENHANDS_OUTPUT_GRACE_S", 1.0)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            agent = self._make_agent(tmpdir)
+            agent.config.persistent_dir.mkdir(parents=True, exist_ok=True)
+            expected_file = Path(tmpdir) / "output.jsonl"
+            expected_file.touch()
+
+            async def finish_write() -> None:
+                await asyncio.sleep(0.15)
+                expected_file.write_text("{}")
+
+            writer = asyncio.create_task(finish_write())
+            cmd = ExecuteContainerCommandArgs(
+                command="agent",
+                expected_file_pattern=str(expected_file),
+                mode="agent",
+                timeout=10,
+            )
+            active = await agent._start_container_command(
+                cmd,
+                "printf 'Instances processed: 100%%\\n'; sleep 100",
+            )
+            result = await agent._finish_container_command(active, cmd)
+            await writer
+            assert result == str(expected_file)
+            assert active.process.returncode is not None
+
+    @pytest.mark.asyncio
     async def test_finish_container_command_nonzero_exit(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             agent = self._make_agent(tmpdir)
@@ -1137,7 +1248,7 @@ class TestRunOpenHandsAgent:
                 timeout=10,
             )
             active = await agent._start_container_command(cmd, "bash -c 'exit 1'")
-            with pytest.raises(AssertionError, match="Command failed with return code"):
+            with pytest.raises(RuntimeError, match="Command failed with return code"):
                 await agent._finish_container_command(active, cmd)
 
     @pytest.mark.asyncio
@@ -1402,6 +1513,7 @@ class TestSWEBenchWrapperBuildApptainerCommand:
             result = wrapper._build_apptainer_command(params, cmd_args)
             assert "apptainer exec" in result
             assert "--writable-tmpfs" in result
+            assert "--pid --no-init" in result
             assert params.container in result
 
     def test_eval_mode_swebench_mounts(self, monkeypatch) -> None:
@@ -1462,6 +1574,7 @@ class TestSWEBenchWrapperBuildApptainerCommand:
             params.persistent_dir.mkdir(parents=True, exist_ok=True)
             (params.persistent_dir / "run_script.sh").write_text("#!/bin/bash")
             (params.persistent_dir / "parsing_script.py").write_text("print('ok')")
+            (params.persistent_dir / "test_patch.diff").write_text("")
 
             oh_dir = Path(params.openhands_setup_dir) / "OpenHands"
             for subdir in [".eval_sessions", "logs", "evaluation/oh"]:
@@ -1477,6 +1590,7 @@ class TestSWEBenchWrapperBuildApptainerCommand:
             result = wrapper._build_apptainer_command(params, cmd_args)
             assert "/root/run_script.sh" in result
             assert "/root/parsing_script.py" in result
+            assert "/root/test_patch.diff" in result
             assert "/root/patch.diff" in result
 
     def test_r2e_gym_agent_removes_tests(self, monkeypatch) -> None:
@@ -1950,7 +2064,14 @@ class TestSWEBenchWrapperRun:
             tools=[],
             metadata={
                 "input": "[]",
-                "metrics": json.dumps({"resolved": False, "patch_exists": True}),
+                "metrics": json.dumps(
+                    {
+                        "resolved": False,
+                        "patch_exists": True,
+                        "mask_sample": True,
+                        "failure_reason": "agent_timeout",
+                    }
+                ),
                 "instance_config": _make_instance_config(tempfile.mkdtemp()).model_dump_json(),
             },
         )
@@ -1976,6 +2097,8 @@ class TestSWEBenchWrapperRun:
             result = await wrapper.run(body)
             assert isinstance(result, SWEBenchVerifyResponse)
             assert result.reward == 0.0
+            assert result.mask_sample is True
+            assert result.failure_reason == "agent_timeout"
 
 
 ########################################

@@ -13,13 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import logging
+import os
 import re
 from copy import deepcopy
 from time import time
 from typing import Any, ClassVar, Dict, List, Optional, Tuple, Union
 from uuid import uuid4
 
-from aiohttp.client_exceptions import ClientResponseError
+from aiohttp.client_exceptions import ClientConnectionError, ClientResponseError
 from fastapi import Request
 from pydantic import BaseModel, Field
 
@@ -64,6 +66,44 @@ from nemo_gym.openai_utils import (
 from nemo_gym.server_utils import SESSION_ID_KEY, is_nemo_gym_fastapi_entrypoint
 
 
+def _normalized_training_metadata(message: Dict[str, Any]) -> Dict[str, Any]:
+    """Return schema-valid lag metadata, replacing timeout-path null sentinels."""
+
+    metadata_keys = ("policy_epoch", "kv_cache_epoch", "num_evictions")
+    if not any(key in message for key in metadata_keys):
+        return {}
+
+    policy_epoch = message.get("policy_epoch")
+    if (
+        not isinstance(policy_epoch, list)
+        or not policy_epoch
+        or any(not isinstance(turn, list) or not turn for turn in policy_epoch)
+    ):
+        policy_epoch = [[(0, 0)]]
+
+    kv_cache_epoch = message.get("kv_cache_epoch")
+    if (
+        not isinstance(kv_cache_epoch, list)
+        or not kv_cache_epoch
+        or any(not isinstance(turn, list) or not turn for turn in kv_cache_epoch)
+    ):
+        kv_cache_epoch = [[(0, 0)]]
+
+    num_evictions = message.get("num_evictions")
+    if (
+        not isinstance(num_evictions, list)
+        or not num_evictions
+        or any(value is None for value in num_evictions)
+    ):
+        num_evictions = [0]
+
+    return {
+        "policy_epoch": policy_epoch,
+        "kv_cache_epoch": kv_cache_epoch,
+        "num_evictions": num_evictions,
+    }
+
+
 class VLLMModelConfig(BaseResponsesAPIModelConfig):
     base_url: Union[str, List[str]]
     api_key: str
@@ -84,6 +124,8 @@ class VLLMModelConfig(BaseResponsesAPIModelConfig):
 
     # Corresponds to the extra_body of OpenAI Client.
     extra_body: Optional[Dict[str, Any]] = None
+    # Optional one-line file publishing a movable backend's current base URL.
+    endpoint_file: Optional[str] = None
 
     def model_post_init(self, context):
         if isinstance(self.base_url, str):
@@ -112,11 +154,13 @@ class VLLMModel(SimpleResponsesAPIModel):
             NeMoGymAsyncOpenAI(
                 base_url=base_url,
                 api_key=self.config.api_key,
+                max_connection_retries=120 if self.config.endpoint_file else None,
             )
             for base_url in self.config.base_url
         ]
 
         self._session_id_to_client: Dict[str, NeMoGymAsyncOpenAI] = dict()
+        self._endpoint_file_mtime: Optional[float] = None
 
         self._converter = self.get_converter()
 
@@ -207,7 +251,15 @@ class VLLMModel(SimpleResponsesAPIModel):
             body_dict = self.config.extra_body | body_dict
 
         client = self._resolve_client(request)
-        response_dict = await client.create_response(**body_dict)
+        try:
+            response_dict = await client.create_response(**body_dict)
+        except ClientConnectionError:
+            previous_url = client.base_url
+            self._maybe_rebind_endpoint()
+            client = self._resolve_client(request)
+            if client.base_url == previous_url:
+                raise
+            response_dict = await client.create_response(**body_dict)
 
         return NeMoGymResponse.model_validate(response_dict)
 
@@ -361,6 +413,13 @@ class VLLMModel(SimpleResponsesAPIModel):
 
         try:
             chat_completion_dict = await client.create_chat_completion(**body_dict)
+        except ClientConnectionError:
+            previous_url = client.base_url
+            self._maybe_rebind_endpoint()
+            client = self._resolve_client(request)
+            if client.base_url == previous_url:
+                raise
+            chat_completion_dict = await client.create_chat_completion(**body_dict)
         except ClientResponseError as e:
             """
             Example messages for out of context length:
@@ -476,7 +535,49 @@ class VLLMModel(SimpleResponsesAPIModel):
             ],
         )
 
+    def _maybe_rebind_endpoint(self) -> None:
+        """Rebind clients when a shared serving job publishes a new endpoint."""
+
+        if not self.config.endpoint_file:
+            return
+        try:
+            mtime = os.stat(self.config.endpoint_file).st_mtime
+            if mtime == self._endpoint_file_mtime:
+                return
+            with open(self.config.endpoint_file) as endpoint_stream:
+                url = endpoint_stream.read().strip()
+            if not url:
+                return
+            self._endpoint_file_mtime = mtime
+            if [url] == self.config.base_url:
+                return
+            logging.getLogger(__name__).warning(
+                "vllm_model '%s': backend endpoint changed %s -> %s; rebinding clients.",
+                getattr(self.config, "name", "?"),
+                self.config.base_url,
+                [url],
+            )
+            self.config.base_url = [url]
+            self._clients = [
+                NeMoGymAsyncOpenAI(
+                    base_url=url,
+                    api_key=self.config.api_key,
+                    max_connection_retries=120,
+                )
+            ]
+            self._session_id_to_client.clear()
+        except FileNotFoundError:
+            # Serving jobs remove the endpoint file during rotation. Keep the
+            # last known-good client until the successor publishes its URL.
+            return
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "endpoint_file rebind check failed",
+                exc_info=True,
+            )
+
     def _resolve_client(self, request: Request) -> NeMoGymAsyncOpenAI:
+        self._maybe_rebind_endpoint()
         session_id = request.session[SESSION_ID_KEY]
         if session_id not in self._session_id_to_client:
             # There is probably a better way to select the endpoint for this request. But this will do for now.
@@ -600,9 +701,7 @@ class VLLMConverter(BaseModel):
                     prompt_token_ids=m["prompt_token_ids"],
                     generation_token_ids=m["generation_token_ids"],
                     generation_log_probs=m["generation_log_probs"],
-                    policy_epoch=m["policy_epoch"],
-                    kv_cache_epoch=m["kv_cache_epoch"],
-                    num_evictions=m["num_evictions"],
+                    **_normalized_training_metadata(m),
                 )
 
         state.flush_assistant()
@@ -828,6 +927,7 @@ class VLLMConverter(BaseModel):
                 "generation_log_probs",
             }
             extras = {k: v for k, v in message_dict.items() if k not in handled_keys}
+            extras.update(_normalized_training_metadata(message_dict))
             response_output[-1] = train_cls(
                 **last_response_output_item.model_dump(),
                 prompt_token_ids=message_dict["prompt_token_ids"],

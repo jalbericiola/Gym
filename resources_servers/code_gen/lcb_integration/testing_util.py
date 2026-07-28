@@ -104,6 +104,11 @@ class MockStdinWithBuffer:
     def readlines(self, *args):
         return self.inputs.split("\n")
 
+    def __iter__(self):
+        # Python resolves special methods on the class, so __getattr__ does not
+        # make this wrapper iterable even though StringIO is iterable.
+        return iter(self._stringio)
+
     def __getattr__(self, name):
         # Delegate other attributes to StringIO
         return getattr(self._stringio, name)
