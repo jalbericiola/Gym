@@ -20,4 +20,4 @@ genrm_model:
       uses_interleaved_reasoning: false
       chat_template_kwargs: null
       extra_body: null
-      endpoint_file: /lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/jbarker/judge_endpoints/kicker_genrm_endpoint.txt
+      endpoint_file: ${oc.env:KICKER_GENRM_ENDPOINT_FILE}
