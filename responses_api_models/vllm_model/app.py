@@ -17,7 +17,7 @@ import logging
 import os
 import re
 from copy import deepcopy
-from time import time
+from time import monotonic, time
 from typing import Any, ClassVar, Dict, List, Optional, Tuple, Union
 from uuid import uuid4
 
@@ -104,6 +104,21 @@ def _normalized_training_metadata(message: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _judge_max_retries() -> int:
+    """Connection retries for endpoint_file-backed (remote judge) backends.
+
+    The historical value was 120, which turns every call to a dead judge into a
+    multi-minute stall instead of a fast failure: the Jul 30 kicker grid logged
+    ~16k connection errors and idled its GPUs waiting on them.
+    """
+    return int(os.environ.get("NEMOGYM_JUDGE_MAX_RETRIES", "8"))
+
+
+def _judge_stale_grace_s() -> float:
+    """How long an unpublished endpoint file may keep its last-known-good client."""
+    return float(os.environ.get("NEMOGYM_JUDGE_STALE_GRACE_S", "300"))
+
+
 class VLLMModelConfig(BaseResponsesAPIModelConfig):
     base_url: Union[str, List[str]]
     api_key: str
@@ -159,13 +174,14 @@ class VLLMModel(SimpleResponsesAPIModel):
             NeMoGymAsyncOpenAI(
                 base_url=base_url,
                 api_key=self.config.api_key,
-                max_connection_retries=120 if self.config.endpoint_file else None,
+                max_connection_retries=_judge_max_retries() if self.config.endpoint_file else None,
             )
             for base_url in self.config.base_url
         ]
 
         self._session_id_to_client: Dict[str, NeMoGymAsyncOpenAI] = dict()
         self._endpoint_file_mtime: Optional[float] = None
+        self._endpoint_missing_since: Optional[float] = None
 
         self._converter = self.get_converter()
 
@@ -553,6 +569,7 @@ class VLLMModel(SimpleResponsesAPIModel):
                 url = endpoint_stream.read().strip()
             if not url:
                 return
+            self._endpoint_missing_since = None
             self._endpoint_file_mtime = mtime
             if [url] == self.config.base_url:
                 return
@@ -567,13 +584,26 @@ class VLLMModel(SimpleResponsesAPIModel):
                 NeMoGymAsyncOpenAI(
                     base_url=url,
                     api_key=self.config.api_key,
-                    max_connection_retries=120,
+                    max_connection_retries=_judge_max_retries(),
                 )
             ]
             self._session_id_to_client.clear()
         except FileNotFoundError:
             # Serving jobs remove the endpoint file during rotation. Keep the
-            # last known-good client until the successor publishes its URL.
+            # last known-good client until the successor publishes its URL --
+            # but bounded: a rotation lasts seconds, whereas with no successor
+            # job this branch silently pins a dead URL for the whole link, and
+            # every judge call then scores a default instead of a reward.
+            now = monotonic()
+            if self._endpoint_missing_since is None:
+                self._endpoint_missing_since = now
+            elif now - self._endpoint_missing_since > _judge_stale_grace_s():
+                raise RuntimeError(
+                    f"vllm_model endpoint file {self.config.endpoint_file} absent for "
+                    f"{now - self._endpoint_missing_since:.0f}s (grace "
+                    f"{_judge_stale_grace_s():.0f}s); refusing to keep scoring against "
+                    "a judge that is no longer published."
+                )
             return
         except Exception:
             logging.getLogger(__name__).warning(
