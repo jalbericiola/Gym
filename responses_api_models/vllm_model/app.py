@@ -119,6 +119,14 @@ def _judge_stale_grace_s() -> float:
     return float(os.environ.get("NEMOGYM_JUDGE_STALE_GRACE_S", "300"))
 
 
+class JudgeEndpointStale(RuntimeError):
+    """The published judge endpoint is gone and no successor has republished.
+
+    Distinct from the generic errors _maybe_rebind_endpoint deliberately
+    swallows: this one must reach the caller and stop the run.
+    """
+
+
 class VLLMModelConfig(BaseResponsesAPIModelConfig):
     base_url: Union[str, List[str]]
     api_key: str
@@ -182,6 +190,7 @@ class VLLMModel(SimpleResponsesAPIModel):
         self._session_id_to_client: Dict[str, NeMoGymAsyncOpenAI] = dict()
         self._endpoint_file_mtime: Optional[float] = None
         self._endpoint_missing_since: Optional[float] = None
+        self._endpoint_unreachable_since: Optional[float] = None
 
         self._converter = self.get_converter()
 
@@ -276,11 +285,12 @@ class VLLMModel(SimpleResponsesAPIModel):
             response_dict = await client.create_response(**body_dict)
         except ClientConnectionError:
             previous_url = client.base_url
-            self._maybe_rebind_endpoint()
+            self._maybe_rebind_endpoint(after_connection_failure=True)
             client = self._resolve_client(request)
             if client.base_url == previous_url:
                 raise
             response_dict = await client.create_response(**body_dict)
+        self._endpoint_unreachable_since = None
 
         return NeMoGymResponse.model_validate(response_dict)
 
@@ -436,7 +446,7 @@ class VLLMModel(SimpleResponsesAPIModel):
             chat_completion_dict = await client.create_chat_completion(**body_dict)
         except ClientConnectionError:
             previous_url = client.base_url
-            self._maybe_rebind_endpoint()
+            self._maybe_rebind_endpoint(after_connection_failure=True)
             client = self._resolve_client(request)
             if client.base_url == previous_url:
                 raise
@@ -453,6 +463,7 @@ class VLLMModel(SimpleResponsesAPIModel):
             3. https://github.com/vllm-project/vllm/blob/685c99ee77b4818dcdd15b30fe0e0eff0d5d22ec/vllm/entrypoints/openai/serving_engine.py#L948
             4. https://github.com/vllm-project/vllm/blob/685c99ee77b4818dcdd15b30fe0e0eff0d5d22ec/vllm/sampling_params.py#L463
             """
+            self._endpoint_unreachable_since = None
             result_content_str = e.response_content.decode()
 
             is_out_of_context_length = e.status == 400 and (
@@ -464,6 +475,8 @@ class VLLMModel(SimpleResponsesAPIModel):
                 return res
             else:
                 raise e
+
+        self._endpoint_unreachable_since = None
 
         choice_dict = chat_completion_dict["choices"][0]
         if self.config.uses_reasoning_parser:
@@ -556,20 +569,29 @@ class VLLMModel(SimpleResponsesAPIModel):
             ],
         )
 
-    def _maybe_rebind_endpoint(self) -> None:
-        """Rebind clients when a shared serving job publishes a new endpoint."""
+    def _maybe_rebind_endpoint(self, *, after_connection_failure: bool = False) -> None:
+        """Rebind clients when a shared serving job publishes a new endpoint.
+
+        Callers on the hot path leave after_connection_failure False: an
+        unchanged endpoint file is the normal steady state. ClientConnectionError
+        handlers pass True, where an unchanged file instead means the publisher
+        died without republishing and the URL we hold is dead.
+        """
 
         if not self.config.endpoint_file:
             return
         try:
             mtime = os.stat(self.config.endpoint_file).st_mtime
             if mtime == self._endpoint_file_mtime:
+                if after_connection_failure:
+                    self._note_endpoint_unreachable()
                 return
             with open(self.config.endpoint_file) as endpoint_stream:
                 url = endpoint_stream.read().strip()
             if not url:
                 return
             self._endpoint_missing_since = None
+            self._endpoint_unreachable_since = None
             self._endpoint_file_mtime = mtime
             if [url] == self.config.base_url:
                 return
@@ -605,10 +627,34 @@ class VLLMModel(SimpleResponsesAPIModel):
                     "a judge that is no longer published."
                 )
             return
+        except JudgeEndpointStale:
+            raise
         except Exception:
             logging.getLogger(__name__).warning(
                 "endpoint_file rebind check failed",
                 exc_info=True,
+            )
+
+    def _note_endpoint_unreachable(self) -> None:
+        """Bound how long we keep dialling a published URL that refuses connections.
+
+        SLURM preemption kills a judge without running its exit trap, so the
+        endpoint file survives with its old contents and mtime and the
+        missing-file grace above never fires. Without this the proxy retries a
+        dead host for the rest of the link while every judge call scores a
+        default and training still reports healthy iterations.
+        """
+        now = monotonic()
+        if self._endpoint_unreachable_since is None:
+            self._endpoint_unreachable_since = now
+            return
+        stale_for = now - self._endpoint_unreachable_since
+        if stale_for > _judge_stale_grace_s():
+            raise JudgeEndpointStale(
+                f"vllm_model endpoint {self.config.base_url} has refused connections for "
+                f"{stale_for:.0f}s (grace {_judge_stale_grace_s():.0f}s) and "
+                f"{self.config.endpoint_file} has not been republished; refusing to keep "
+                "scoring against a judge that is no longer serving."
             )
 
     def _resolve_client(self, request: Request) -> NeMoGymAsyncOpenAI:

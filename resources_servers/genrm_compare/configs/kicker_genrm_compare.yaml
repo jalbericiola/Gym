@@ -20,7 +20,7 @@ genrm_compare_resources_server:
         type: responses_api_models
         name: genrm_model
       num_rollouts_per_prompt: 16
-      cohort_timeout_s: 1800
+      cohort_timeout_s: 3600
       genrm_responses_create_params:
         input: []
         max_output_tokens: 24576
