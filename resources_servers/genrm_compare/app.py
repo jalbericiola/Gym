@@ -325,11 +325,18 @@ class GenRMCompareResourcesServer(SimpleResourcesServer):
             _cohort_buffers[cohort_key].append((body, future))
             _cohort_last_arrival[cohort_key] = time.monotonic()
             buf = _cohort_buffers[cohort_key]
+            decs = _cohort_decrements.get(cohort_key, 0)
             if len(buf) >= max(
                 _cohort_effective_expected_locked(cohort_key, cfg.num_rollouts_per_prompt), 1
             ):
                 cohort_ready = True
                 cohort_buf = _cohort_claim_locked(cohort_key)
+        if cohort_ready and decs:
+            logger.info(
+                "[GenRM] cohort %s completed count-exact at %d rollouts "
+                "(%d upstream failures decremented).",
+                cohort_key, len(cohort_buf), decs,
+            )
 
         if cohort_ready:
             await self._score_cohort(cohort_buf, principle)
@@ -487,6 +494,10 @@ class GenRMCompareResourcesServer(SimpleResourcesServer):
                 _cohort_effective_expected_locked(key, cfg.num_rollouts_per_prompt), 1
             ):
                 cohort_buf = _cohort_claim_locked(key)
+        logger.info(
+            "[GenRM] cohort %s decrement +%d (total %d); completed=%s.",
+            key, count, _cohort_decrements.get(key, count), cohort_buf is not None,
+        )
         if cohort_buf:
             await self._score_cohort(cohort_buf, principle=None)
         return {
