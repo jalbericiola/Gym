@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI
@@ -59,9 +60,66 @@ from resources_servers.genrm_compare.utils import (
 
 logger = logging.getLogger(__name__)
 
-# Cohort state for verify(): buffer by prompt_key until num_rollouts_per_prompt received (Difference 1)
+# Cohort state for verify().
+#
+# Keying: a cohort is keyed by the producer-stamped `cohort_group_id` when the
+# request carries one (exact GRPO-group identity), falling back to prompt_key
+# (hash of prompt+principle) for callers that do not stamp groups. The fallback
+# is ambiguous by construction: two concurrent groups on the same prompt share
+# a buffer, the first num_rollouts_per_prompt arrivals are scored together and
+# the leftovers form a cohort that can never fill (observed as the 1/16..4/16
+# partial-cohort timeouts on the d3 kicker grid, 2026-07).
+#
+# Completion: a cohort is scored the moment
+#     arrivals >= expected - decrements
+# where `expected` is the producer-declared `cohort_expected_size` (else the
+# num_rollouts_per_prompt config) and `decrements` arrive via POST
+# /cohort_decrement whenever the producer learns a group member failed upstream
+# and will never call verify. This is count-exact: no timing heuristic decides
+# completion, so slow-but-healthy groups are never split. cohort_timeout_s
+# remains as a pure backstop (e.g. producer died before decrementing).
 _cohort_lock: asyncio.Lock = asyncio.Lock()
 _cohort_buffers: Dict[str, List[Tuple[Any, asyncio.Future]]] = {}
+_cohort_expected: Dict[str, int] = {}
+_cohort_decrements: Dict[str, int] = {}
+# monotonic timestamp of the most recent activity (arrival or decrement) per
+# key; drives the optional idle grace and TTL cleanup of orphaned bookkeeping.
+_cohort_last_arrival: Dict[str, float] = {}
+
+
+def _cohort_claim_locked(key: str):
+    """Pop and return a cohort's buffer, clearing all its bookkeeping.
+
+    Caller must hold _cohort_lock. Returns None if no buffer is open.
+    """
+    buf = _cohort_buffers.pop(key, None)
+    _cohort_expected.pop(key, None)
+    _cohort_decrements.pop(key, None)
+    _cohort_last_arrival.pop(key, None)
+    return buf
+
+
+def _cohort_effective_expected_locked(key: str, default_expected: int) -> int:
+    return _cohort_expected.get(key, default_expected) - _cohort_decrements.get(key, 0)
+
+
+def _cohort_prune_orphans_locked(ttl_s: float) -> None:
+    """Drop bookkeeping for keys with no open buffer and no recent activity.
+
+    Orphans arise from decrements that outlive their cohort (e.g. a retry
+    duplicate filled the buffer early) -- without an open buffer there is no
+    waiter to clean them up. Keys with open buffers are cleaned by waiters.
+    """
+    now = time.monotonic()
+    stale = [
+        k
+        for k, t in _cohort_last_arrival.items()
+        if k not in _cohort_buffers and now - t > ttl_s
+    ]
+    for k in stale:
+        _cohort_expected.pop(k, None)
+        _cohort_decrements.pop(k, None)
+        _cohort_last_arrival.pop(k, None)
 
 
 class GenRMCompareConfig(BaseResourcesServerConfig):
@@ -102,6 +160,18 @@ class GenRMCompareConfig(BaseResourcesServerConfig):
     # cohort peers hung). On timeout the first waiter claims the partial
     # cohort and scores it (default score if fewer than 2 responses).
     cohort_timeout_s: float = 1800.0
+
+    # Idle grace (opt-in, DISABLED by default): once a cohort stops growing for
+    # this long, score what has arrived instead of waiting out cohort_timeout_s.
+    # The judge cannot distinguish "peer died upstream" from "peer is still
+    # generating" by timing alone, so any grace short enough to be useful can
+    # split a slow-but-healthy group into partial comparisons (generation gaps
+    # of many minutes are normal at long sequence lengths). Prefer the
+    # count-exact mechanism: producers stamp cohort_group_id /
+    # cohort_expected_size on /run and POST /cohort_decrement on upstream
+    # failures, which completes cohorts at their true size with no timing
+    # guess. Enable the grace only for envs whose arrival gaps are known-small.
+    cohort_idle_grace_s: float = 0.0
 
     # Comparison strategy
     comparison_strategy: str = "circular"  # "all_pairs" or "circular"
@@ -150,6 +220,19 @@ class GenRMCompareVerifyRequest(BaseVerifyRequest):
     """Verify request with optional principle for cohort-based GenRM comparison."""
 
     principle: Optional[str] = None  # Principle for principle-based GenRM; forwarded by agent when provided
+
+
+class CohortDecrementRequest(BaseModel):
+    """Producer notification that a group member failed upstream.
+
+    Sent by the rollout producer when a /run sub-request dies after retries and
+    is replaced by a training placeholder that will never reach /verify. Lets
+    the matching cohort complete at its true survivor count instead of waiting
+    out cohort_timeout_s.
+    """
+
+    cohort_group_id: str
+    count: int = 1
 
 
 class GenRMCompareRequest(BaseModel):
@@ -217,35 +300,89 @@ class GenRMCompareResourcesServer(SimpleResourcesServer):
             input_messages if isinstance(input_messages, list) else list(input_messages),
             principle,
         )
+        # Exact group identity when the producer stamps it (extra="allow" lets
+        # cohort_group_id / cohort_expected_size ride through /run -> /verify
+        # untouched); prompt_key fallback otherwise.
+        group_id = getattr(body, "cohort_group_id", None)
+        cohort_key = str(group_id) if group_id else prompt_key
+        declared = getattr(body, "cohort_expected_size", None)
+        try:
+            declared = int(declared) if declared is not None else None
+        except (TypeError, ValueError):
+            declared = None
         future: asyncio.Future[float] = asyncio.get_running_loop().create_future()
 
         cohort_ready = False
         cohort_buf = None
         async with _cohort_lock:
-            if prompt_key not in _cohort_buffers:
-                _cohort_buffers[prompt_key] = []
-            _cohort_buffers[prompt_key].append((body, future))
-            buf = _cohort_buffers[prompt_key]
-            if len(buf) >= cfg.num_rollouts_per_prompt:
-                assert len(buf) == cfg.num_rollouts_per_prompt
+            _cohort_prune_orphans_locked(2 * cfg.cohort_timeout_s)
+            if cohort_key not in _cohort_buffers:
+                _cohort_buffers[cohort_key] = []
+                _cohort_expected.setdefault(
+                    cohort_key,
+                    declared if declared and declared > 0 else cfg.num_rollouts_per_prompt,
+                )
+            _cohort_buffers[cohort_key].append((body, future))
+            _cohort_last_arrival[cohort_key] = time.monotonic()
+            buf = _cohort_buffers[cohort_key]
+            if len(buf) >= max(
+                _cohort_effective_expected_locked(cohort_key, cfg.num_rollouts_per_prompt), 1
+            ):
                 cohort_ready = True
-                cohort_buf = list(buf)
-                del _cohort_buffers[prompt_key]
+                cohort_buf = _cohort_claim_locked(cohort_key)
 
         if cohort_ready:
             await self._score_cohort(cohort_buf, principle)
 
+        # Wait for the cohort to be scored. Completion is count-exact (arrivals
+        # >= expected - decrements, resolved in verify() and /cohort_decrement),
+        # so this wait is normally released by the last surviving peer or by the
+        # producer's decrement. The optional idle grace (opt-in; see config) and
+        # the hard cohort_timeout_s remain as backstops for producers that do
+        # not stamp groups or died before decrementing.
+        deadline = time.monotonic() + cfg.cohort_timeout_s
+        grace = cfg.cohort_idle_grace_s if cfg.cohort_idle_grace_s > 0 else None
         try:
-            reward = await asyncio.wait_for(asyncio.shield(future), timeout=cfg.cohort_timeout_s)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                wait_s = min(grace, remaining) if grace else remaining
+                try:
+                    reward = await asyncio.wait_for(asyncio.shield(future), timeout=wait_s)
+                    break
+                except asyncio.TimeoutError:
+                    if future.done():
+                        reward = await future
+                        break
+                    if grace is None:
+                        raise
+                    # Claim the cohort only if it has genuinely gone idle. The
+                    # pop under the lock is atomic, so exactly one waiter scores
+                    # it and the rest resolve off the same futures.
+                    async with _cohort_lock:
+                        last = _cohort_last_arrival.get(cohort_key)
+                        idle = last is not None and (time.monotonic() - last) >= grace
+                        stale_buf = _cohort_claim_locked(cohort_key) if idle else None
+                    if stale_buf:
+                        logger.warning(
+                            "[GenRM] Cohort %s idle %.0fs with %d/%d rollouts; "
+                            "scoring partial cohort.",
+                            cohort_key, grace, len(stale_buf), cfg.num_rollouts_per_prompt,
+                        )
+                        await self._score_cohort(stale_buf, principle)
+                        reward = await future
+                        break
         except asyncio.TimeoutError:
-            # Cohort never filled (a peer sub-request died upstream). Claim
-            # whatever arrived and score it so no waiter hangs the wave.
+            # Hard backstop: the cohort neither completed nor (if enabled) went
+            # idle within cohort_timeout_s. Claim whatever arrived so no waiter
+            # hangs the wave.
             async with _cohort_lock:
-                stale_buf = _cohort_buffers.pop(prompt_key, None)
+                stale_buf = _cohort_claim_locked(cohort_key)
             if stale_buf:
                 logger.warning(
-                    "[GenRM] Cohort for prompt_key=%s timed out with %d/%d rollouts; scoring partial cohort.",
-                    prompt_key, len(stale_buf), cfg.num_rollouts_per_prompt,
+                    "[GenRM] Cohort %s timed out with %d/%d rollouts; scoring partial cohort.",
+                    cohort_key, len(stale_buf), cfg.num_rollouts_per_prompt,
                 )
                 await self._score_cohort(stale_buf, principle)
             reward = await future
@@ -284,6 +421,7 @@ class GenRMCompareResourcesServer(SimpleResourcesServer):
     def setup_webserver(self) -> FastAPI:
         app = super().setup_webserver()
         app.post("/compare")(self.compare)
+        app.post("/cohort_decrement")(self.cohort_decrement)
         return app
 
     async def _run_compare(
@@ -327,6 +465,35 @@ class GenRMCompareResourcesServer(SimpleResourcesServer):
             group_answer_length_penalty_coeff=cfg.group_answer_length_penalty_coeff,
         )
         return rewards, metrics, list(comparison_results), comparison_metadata
+
+    async def cohort_decrement(self, body: CohortDecrementRequest) -> Dict[str, Any]:
+        """Record upstream group-member failures; complete the cohort if satisfied.
+
+        Decrements are banked per cohort_group_id. If the group's open cohort now
+        satisfies arrivals >= expected - decrements, it is claimed and scored
+        here so its waiters resolve immediately. Decrements arriving before any
+        member (or after the cohort was claimed) are banked and TTL-pruned.
+        """
+        cfg = self.config
+        key = str(body.cohort_group_id)
+        count = max(int(body.count), 0)
+        cohort_buf = None
+        async with _cohort_lock:
+            _cohort_prune_orphans_locked(2 * cfg.cohort_timeout_s)
+            _cohort_decrements[key] = _cohort_decrements.get(key, 0) + count
+            _cohort_last_arrival[key] = time.monotonic()
+            buf = _cohort_buffers.get(key)
+            if buf and len(buf) >= max(
+                _cohort_effective_expected_locked(key, cfg.num_rollouts_per_prompt), 1
+            ):
+                cohort_buf = _cohort_claim_locked(key)
+        if cohort_buf:
+            await self._score_cohort(cohort_buf, principle=None)
+        return {
+            "cohort_group_id": key,
+            "decrements": _cohort_decrements.get(key, count),
+            "completed": cohort_buf is not None,
+        }
 
     async def compare(self, body: GenRMCompareRequest) -> GenRMCompareResponse:
         """Compare multiple responses using GenRM pairwise comparisons (batch API)."""
