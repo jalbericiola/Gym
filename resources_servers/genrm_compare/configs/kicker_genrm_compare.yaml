@@ -20,7 +20,12 @@ genrm_compare_resources_server:
         type: responses_api_models
         name: genrm_model
       num_rollouts_per_prompt: 16
-      cohort_timeout_s: 1800
+      # Backstop only: completion is count-exact (cohort_group_id + upstream
+      # failure decrements), so this fires only when the producer died without
+      # decrementing. It must exceed a group's first-to-last verify arrival
+      # spread, or it splits healthy slow groups: at 131k SL a wave's length
+      # spread alone can pass 30 min. 1800 predates count-exact completion.
+      cohort_timeout_s: 5400
       genrm_responses_create_params:
         input: []
         max_output_tokens: 24576
