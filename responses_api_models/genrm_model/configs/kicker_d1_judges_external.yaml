@@ -1,0 +1,50 @@
+# d1 external judge instances: NVIDIA API Catalog backends replacing the
+# standalone serving jobs (serve_judge_nl2bash.sh / serve_judge_safety.sh).
+# Same instance names the resources-server overrides resolve
+# (kicker_d1_overrides.yaml), so consumers need no changes. No endpoint_file:
+# the API endpoint is static, which also retires the endpoint-file-absent
+# FileNotFoundError storm failure mode.
+#
+# Validated 2026-08-18: both models reachable from HSG compute nodes and
+# instant at cohort-burst concurrency (16-way wall 2-3s).
+# policy_model_reasoning_off stays IN-JOB (it is the policy backend with
+# thinking disabled, not an external judge) -- load kicker_d1_judges_remote.yaml
+# semantics for it via this file to keep the extra-config-paths list stable.
+nl2bash_judge_model:
+  responses_api_models:
+    vllm_model:
+      entrypoint: app.py
+      base_url: https://integrate.api.nvidia.com/v1
+      api_key: ${oc.env:NVIDIA_API_KEY}
+      model: private/nemotron/qwen/qwen3-235b-a22b-instruct-2507
+      return_token_id_information: false
+      uses_reasoning_parser: false
+      uses_interleaved_reasoning: false
+      chat_template_kwargs: null
+      extra_body: null
+
+safety_judge_model:
+  responses_api_models:
+    vllm_model:
+      entrypoint: app.py
+      base_url: https://integrate.api.nvidia.com/v1
+      api_key: ${oc.env:NVIDIA_API_KEY}
+      model: private/nemotron/nvidia/nemotron-content-safety-reasoning-4b
+      return_token_id_information: false
+      uses_reasoning_parser: false
+      uses_interleaved_reasoning: false
+      chat_template_kwargs: null
+      extra_body: null
+
+policy_model_reasoning_off:
+  responses_api_models:
+    vllm_model:
+      entrypoint: app.py
+      base_url: ${policy_base_url}
+      api_key: ${policy_api_key}
+      model: ${policy_model_name}
+      return_token_id_information: true
+      uses_reasoning_parser: true
+      chat_template_kwargs:
+        enable_thinking: false
+      sequential_reasoning_allowed: false

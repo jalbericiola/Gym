@@ -1,0 +1,31 @@
+# External GenRM judge: same instance name (`genrm_model`) the consumers
+# resolve, backed by the NVIDIA API Catalog instead of a self-hosted vLLM job.
+#
+# Model: NVIDIA-Nemotron-3-Ultra-550B-A55B-GenRM -- the judge the honest-dolphin
+# reference ACTUALLY used (its NRL_GENRM_MODEL_PATH=qwen235b_...step1230 default
+# is a decoy the launch never routes through; the genrm URL it injects serves
+# the ultra 550B, confirmed by Gerald Shen 2026-08-18). Switching here therefore
+# IMPROVES reference parity vs our self-hosted qwen235b judge -- but it CHANGES
+# reward values, so runs scored by this judge are not comparable to runs scored
+# by the qwen235b one.
+#
+# Validated 2026-08-18 from HSG compute nodes:
+#   egress OK; custom roles (principle/response_1/response_2) accepted; output
+#   parses via parse_genrm_output (retries re-call the judge, so the ~6-10%
+#   single-shot parse failures are ~0.1% terminal); latency ~3-5 min per call
+#   with real replica depth (16-way wall 270s, 64-way wall 340s).
+#
+# Requires NVIDIA_API_KEY in the gym process environment (the launcher sources
+# ~/.nvidia_api_key.sh -- never commit or echo the value).
+genrm_model:
+  responses_api_models:
+    vllm_model:
+      entrypoint: app.py
+      base_url: https://integrate.api.nvidia.com/v1
+      api_key: ${oc.env:NVIDIA_API_KEY}
+      model: private/ultra-genrm/nvidia/nemotron3-ultra-genrm
+      return_token_id_information: false
+      uses_reasoning_parser: false
+      uses_interleaved_reasoning: false
+      chat_template_kwargs: null
+      extra_body: null
