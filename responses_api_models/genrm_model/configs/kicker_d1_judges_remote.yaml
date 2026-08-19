@@ -27,7 +27,7 @@ nl2bash_judge_model:
       uses_interleaved_reasoning: false
       chat_template_kwargs: null
       extra_body: null
-      endpoint_file: /lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/jalbericiola/mrl_internal/judge_nl2bash_endpoint.txt
+      endpoint_file: ${oc.env:JUDGE_NL2BASH_ENDPOINT_FILE}
 
 safety_judge_model:
   responses_api_models:
@@ -41,7 +41,7 @@ safety_judge_model:
       uses_interleaved_reasoning: false
       chat_template_kwargs: null
       extra_body: null
-      endpoint_file: /lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/jalbericiola/mrl_internal/judge_safety_endpoint.txt
+      endpoint_file: ${oc.env:JUDGE_SAFETY_ENDPOINT_FILE}
 
 policy_model_reasoning_off:
   responses_api_models:
