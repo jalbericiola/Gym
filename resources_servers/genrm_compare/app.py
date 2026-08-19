@@ -331,7 +331,11 @@ class GenRMCompareResourcesServer(SimpleResourcesServer):
             ):
                 cohort_ready = True
                 cohort_buf = _cohort_claim_locked(cohort_key)
-        if cohort_ready and decs:
+        if cohort_ready:
+            # Log EVERY completion, not just decrement-assisted ones: a clean
+            # full cohort otherwise completes invisibly, which made the e2e
+            # canary's success path unobservable (2026-08-19). A few lines per
+            # iteration; cheap.
             logger.info(
                 "[GenRM] cohort %s completed count-exact at %d rollouts "
                 "(%d upstream failures decremented).",
