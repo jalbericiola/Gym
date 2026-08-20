@@ -11,6 +11,37 @@ agent_framework_commit=$AGENT_FRAMEWORK_COMMIT
 
 cd $setup_dir
 
+# Cross-job setup lock. Multiple training chains share this setup tree; two
+# concurrent openhands.sh runs (one installing while another rebuilds) corrupt
+# it — observed 2026-08-20: a conda transaction interrupted mid-flight left
+# site-packages mode 555 with an unremovable dist-info, and every subsequent
+# link's gym died at startup on 'rm: Permission denied'. mkdir is atomic on
+# Lustre. Stale locks (holder SIGKILLed, trap never ran) are broken after
+# 45 min — a full cold rebuild takes ~20-30 min. Completed setups still pass
+# through here quickly: the checks below are idempotent and cheap.
+_OH_SETUP_LOCK="$setup_dir/.openhands_setup.lockdir"
+_oh_lock_acquired=0
+for _i in $(seq 1 360); do
+    if mkdir "$_OH_SETUP_LOCK" 2>/dev/null; then
+        _oh_lock_acquired=1
+        echo "$$ $(hostname) $(date +%s)" > "$_OH_SETUP_LOCK/holder" || true
+        break
+    fi
+    _now=$(date +%s); _mt=$(stat -c %Y "$_OH_SETUP_LOCK" 2>/dev/null || echo "$_now")
+    if [ $((_now - _mt)) -gt 2700 ]; then
+        echo "openhands setup lock stale ($((_now - _mt))s > 2700s); breaking it"
+        rm -rf "$_OH_SETUP_LOCK" 2>/dev/null || true
+        continue
+    fi
+    [ $((_i % 12)) -eq 0 ] && echo "waiting for openhands setup lock held elsewhere ($((_i * 10))s elapsed)..."
+    sleep 10
+done
+if [ "$_oh_lock_acquired" != "1" ]; then
+    echo "FATAL: could not acquire openhands setup lock after 3600s" >&2
+    exit 1
+fi
+trap 'rm -rf "$_OH_SETUP_LOCK" 2>/dev/null || true' EXIT
+
 # Install miniforge if not properly installed
 if [ ! -f "$miniforge_dir/bin/conda" ] || [ ! -f "$miniforge_dir/bin/mamba" ]; then
     echo "Installing miniforge..."
