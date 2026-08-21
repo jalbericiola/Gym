@@ -42,6 +42,18 @@ if [ "$_oh_lock_acquired" != "1" ]; then
 fi
 trap 'rm -rf "$_OH_SETUP_LOCK" 2>/dev/null || true' EXIT
 
+# Self-repair: a link hard-killed mid-conda-transaction leaves site-packages
+# mode 555 (read-only) — every later install then fails "Permission denied"
+# and ALL SWE chains crash-loop at gym boot (2026-08-20 23:29 recurrence of
+# the same corruption the lockdir was added for; the EXIT trap can't run on
+# SIGKILL/node death, so serialization alone can't prevent it). Restore the
+# user write bit on the interpreter tree before any install/rm below.
+_OH_SP="$miniforge_dir/lib"
+if [ -d "$_OH_SP" ] && ! find "$_OH_SP" -maxdepth 3 -name site-packages -writable | grep -q .; then
+    echo "openhands.sh: read-only site-packages detected; restoring write perms..."
+    chmod -R u+w "$_OH_SP" 2>/dev/null || true
+fi
+
 # Install miniforge if not properly installed
 if [ ! -f "$miniforge_dir/bin/conda" ] || [ ! -f "$miniforge_dir/bin/mamba" ]; then
     echo "Installing miniforge..."
