@@ -336,7 +336,10 @@ class GenRMCompareResourcesServer(SimpleResourcesServer):
             # full cohort otherwise completes invisibly, which made the e2e
             # canary's success path unobservable (2026-08-19). A few lines per
             # iteration; cheap.
-            logger.info(
+            # WARNING not INFO: the gym's logging config suppresses app-logger
+            # INFO entirely (verified: zero INFO lines in a 79k-line gym.log),
+            # which made completions invisible to the e2e canary twice.
+            logger.warning(
                 "[GenRM] cohort %s completed count-exact at %d rollouts "
                 "(%d upstream failures decremented).",
                 cohort_key, len(cohort_buf), decs,
@@ -498,7 +501,7 @@ class GenRMCompareResourcesServer(SimpleResourcesServer):
                 _cohort_effective_expected_locked(key, cfg.num_rollouts_per_prompt), 1
             ):
                 cohort_buf = _cohort_claim_locked(key)
-        logger.info(
+        logger.warning(
             "[GenRM] cohort %s decrement +%d (total %d); completed=%s.",
             key, count, _cohort_decrements.get(key, count), cohort_buf is not None,
         )
