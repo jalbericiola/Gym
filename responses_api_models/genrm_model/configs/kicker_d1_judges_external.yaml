@@ -31,7 +31,7 @@ safety_judge_model:
       api_key: ${oc.env:NVIDIA_API_KEY}
       model: private/nemotron/nvidia/nemotron-content-safety-reasoning-4b
       return_token_id_information: false
-      uses_reasoning_parser: false
+      uses_reasoning_parser: true
       uses_interleaved_reasoning: false
       chat_template_kwargs: null
       extra_body: null
