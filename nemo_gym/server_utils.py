@@ -74,6 +74,13 @@ from nemo_gym.profiling import Profiler
 
 
 _GLOBAL_AIOHTTP_CLIENT: Union[None, ClientSession] = None
+# The event loop the session was created under (None = created outside any
+# running loop). A ClientSession/TCPConnector binds futures/locks to its
+# creation loop; awaiting it from a DIFFERENT loop parks forever with no
+# socket, no CPU and no error — the v35 judge-dispatch wedge (2026-08-21):
+# genrm_model's /v1/responses handler awaited a session first touched on a
+# transient pre-uvicorn loop, so every outbound judge call hung eternally.
+_GLOBAL_AIOHTTP_CLIENT_LOOP = None
 _GLOBAL_AIOHTTP_CLIENT_REQUEST_DEBUG: bool = False
 
 
@@ -88,10 +95,31 @@ def get_global_aiohttp_client(
     global_config_dict_parser_config: Optional[GlobalConfigDictParserConfig] = None,
     global_config_dict_parser_cls: Type[GlobalConfigDictParser] = GlobalConfigDictParser,
 ) -> ClientSession:  # pragma: no cover
-    global _GLOBAL_AIOHTTP_CLIENT
+    global _GLOBAL_AIOHTTP_CLIENT, _GLOBAL_AIOHTTP_CLIENT_LOOP
+
+    try:
+        _running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        _running_loop = None
 
     if _GLOBAL_AIOHTTP_CLIENT is not None:
-        return _GLOBAL_AIOHTTP_CLIENT
+        # Loop-identity guard (see _GLOBAL_AIOHTTP_CLIENT_LOOP note above):
+        # if the singleton was created under a different loop than the one
+        # now awaiting it, rebuild it on the current loop. The stale session
+        # is abandoned rather than closed — closing cross-loop is unsafe, and
+        # any awaits parked on it are already unrecoverable. Healthy
+        # processes (same loop throughout) never take this branch.
+        if _running_loop is not None and _GLOBAL_AIOHTTP_CLIENT_LOOP is not _running_loop:
+            print(
+                "[server_utils] LOOP-IDENTITY GUARD: global aiohttp client was created under "
+                f"loop {id(_GLOBAL_AIOHTTP_CLIENT_LOOP) if _GLOBAL_AIOHTTP_CLIENT_LOOP else None} "
+                f"but is being used from loop {id(_running_loop)}; rebuilding the session on the "
+                "current loop (awaits on a cross-loop session park forever)."
+            )
+            _GLOBAL_AIOHTTP_CLIENT = None
+            _GLOBAL_AIOHTTP_CLIENT_LOOP = None
+        else:
+            return _GLOBAL_AIOHTTP_CLIENT
 
     #global_config_dict = get_global_config_dict(
     #    global_config_dict_parser_config=global_config_dict_parser_config,
@@ -119,6 +147,14 @@ def set_global_aiohttp_client(cfg: GlobalAIOHTTPAsyncClientConfig) -> ClientSess
 
     global _GLOBAL_AIOHTTP_CLIENT
     _GLOBAL_AIOHTTP_CLIENT = client_session
+
+    # Record the creating loop for the loop-identity guard in
+    # get_global_aiohttp_client (cross-loop awaits park forever).
+    global _GLOBAL_AIOHTTP_CLIENT_LOOP
+    try:
+        _GLOBAL_AIOHTTP_CLIENT_LOOP = asyncio.get_running_loop()
+    except RuntimeError:
+        _GLOBAL_AIOHTTP_CLIENT_LOOP = None
 
     global _GLOBAL_AIOHTTP_CLIENT_REQUEST_DEBUG
     _GLOBAL_AIOHTTP_CLIENT_REQUEST_DEBUG = cfg.global_aiohttp_client_request_debug
