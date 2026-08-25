@@ -15,6 +15,14 @@ example_session_state_mgmt_simple_agent:
       model_server:
         type: responses_api_models
         name: policy_model
+      # Disabled by default globally. This example can opt in because its
+      # Resources server implements checkpoint_session and restore_session.
+      mid_episode_resume:
+        enabled: false
+        require_policy_version: true
+        checkpoint_store:
+          type: filesystem
+          root_dir: /tmp/nemo-gym/episode-checkpoints
       datasets:
       - name: train
         type: train

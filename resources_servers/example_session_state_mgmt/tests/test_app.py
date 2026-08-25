@@ -64,3 +64,37 @@ class TestApp:
 
         response = client.post("/get_counter_value", cookies=initial_request_cookies)
         assert response.json() == {"count": 2}
+
+    def test_checkpoint_and_restore_into_new_session(self) -> None:
+        config = StatefulCounterResourcesServerConfig(
+            host="0.0.0.0",
+            port=8080,
+            entrypoint="",
+            name="",
+        )
+        server = StatefulCounterResourcesServer(config=config, server_client=MagicMock(spec=ServerClient))
+        client = TestClient(server.setup_webserver())
+
+        assert client.get("/session_checkpointing").json() == {
+            "supported": True,
+            "protocol_version": 1,
+            "format_name": "example_session_state_mgmt.counter",
+            "format_version": 1,
+        }
+
+        seed = client.post("/seed_session", json={"initial_count": 3})
+        active_cookies = seed.cookies
+        client.post("/increment_counter", json={"count": 2}, cookies=active_cookies)
+        snapshot = client.post("/checkpoint_session", cookies=active_cookies).json()
+        assert snapshot == {
+            "protocol_version": 1,
+            "format_name": "example_session_state_mgmt.counter",
+            "format_version": 1,
+            "kind": "inline",
+            "payload": {"count": 5},
+        }
+
+        # A new client has no old session cookie, so middleware assigns a distinct session.
+        restored_client = TestClient(server.setup_webserver())
+        restored = restored_client.post("/restore_session", json={"snapshot": snapshot})
+        assert restored_client.post("/get_counter_value", cookies=restored.cookies).json() == {"count": 5}

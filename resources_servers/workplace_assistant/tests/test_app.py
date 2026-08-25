@@ -19,10 +19,8 @@ from fastapi import Request
 from pytest import fixture
 
 from nemo_gym.base_resources_server import BaseSeedSessionRequest
-from nemo_gym.openai_utils import (
-    NeMoGymResponse,
-    NeMoGymResponseCreateParamsNonStreaming,
-)
+from nemo_gym.episode_checkpoint import RestoreSessionRequest, SessionSnapshot
+from nemo_gym.openai_utils import NeMoGymResponse, NeMoGymResponseCreateParamsNonStreaming
 from nemo_gym.server_utils import SESSION_ID_KEY, ServerClient
 from resources_servers.workplace_assistant.app import (
     WorkbenchRequest,
@@ -57,6 +55,54 @@ class TestApp:
             [{"user_engaged": "False"}]  # Keep as a string
         )
         analytics_tool_instance._plots_data = pd.DataFrame(columns=["file_path"])
+
+    async def test_checkpoint_and_restore_into_new_session(self, config: WorkbenchResourcesServerConfig) -> None:
+        resources_server = self.init_server(config)
+        active_session_id = "workplace_active"
+        active_request = Request(scope={"type": "http", "session": {SESSION_ID_KEY: active_session_id}})
+        await resources_server.seed_session(active_request, BaseSeedSessionRequest())
+
+        create_response = await resources_server.route_to_python_function(
+            path="calendar_create_event",
+            body=WorkbenchRequest(
+                event_name="Resume design review",
+                participant_email="laura@example.com",
+                event_start="2026-08-12 09:00:00",
+                duration="30",
+            ),
+            request=active_request,
+        )
+        event_id = create_response.output
+        assert isinstance(event_id, str)
+
+        capability = await resources_server.session_checkpointing()
+        assert capability.supported is True
+        assert capability.format_name == "workplace_assistant.tool_state"
+
+        snapshot = await resources_server.checkpoint_session(active_request)
+        # Exercise the actual JSON representation persisted by EpisodeCheckpoint.
+        snapshot = SessionSnapshot.model_validate_json(snapshot.model_dump_json())
+
+        restored_session_id = "workplace_restored"
+        restored_request = Request(scope={"type": "http", "session": {SESSION_ID_KEY: restored_session_id}})
+        await resources_server.restore_session(
+            restored_request,
+            RestoreSessionRequest(snapshot=snapshot),
+        )
+
+        lookup_response = await resources_server.route_to_python_function(
+            path="calendar_get_event_information_by_id",
+            body=WorkbenchRequest(event_id=event_id, field="event_name"),
+            request=restored_request,
+        )
+        assert lookup_response.output == {"event_name": "Resume design review"}
+        assert (
+            resources_server.session_id_to_tool_env[active_session_id]
+            is not resources_server.session_id_to_tool_env[restored_session_id]
+        )
+
+        await resources_server.discard_session(restored_request)
+        assert restored_session_id not in resources_server.session_id_to_tool_env
 
     async def test_company_directory_find_email_address(self, config: WorkbenchResourcesServerConfig) -> None:
         mock_data = {"email_address": ["aisha.chen@atlas.com", "carlos.rodriguez@atlas.com"]}

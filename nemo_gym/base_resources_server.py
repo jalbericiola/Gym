@@ -14,10 +14,17 @@
 # limitations under the License.
 from abc import abstractmethod
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
 from nemo_gym.config_types import AggregateMetrics, AggregateMetricsRequest
+from nemo_gym.episode_checkpoint import (
+    DiscardSessionResponse,
+    RestoreSessionRequest,
+    RestoreSessionResponse,
+    SessionCheckpointingCapability,
+    SessionSnapshot,
+)
 from nemo_gym.openai_utils import (
     NeMoGymResponse,
     NeMoGymResponseCreateParamsNonStreaming,
@@ -66,11 +73,37 @@ class SimpleResourcesServer(BaseResourcesServer, AggregateMetricsMixin, SimpleSe
         app.post("/seed_session")(self.seed_session)
         app.post("/verify")(self.verify)
         app.post("/aggregate_metrics")(self.aggregate_metrics)
+        app.post("/checkpoint_session")(self.checkpoint_session)
+        app.post("/restore_session")(self.restore_session)
+        app.get("/session_checkpointing")(self.session_checkpointing)
+        app.post("/discard_session")(self.discard_session)
 
         return app
 
     async def seed_session(self, body: BaseSeedSessionRequest) -> BaseSeedSessionResponse:
         return BaseSeedSessionResponse()
+
+    async def checkpoint_session(self, request: Request) -> SessionSnapshot:
+        """Return state needed to recreate this session.
+
+        Resource servers must override this method before an agent can enable
+        mid-episode resume for them.
+        """
+
+        raise HTTPException(status_code=501, detail="This resources server does not support session snapshots")
+
+    async def restore_session(self, request: Request, body: RestoreSessionRequest) -> RestoreSessionResponse:
+        """Restore a snapshot into the new session assigned by middleware."""
+
+        raise HTTPException(status_code=501, detail="This resources server does not support session snapshots")
+
+    async def session_checkpointing(self) -> SessionCheckpointingCapability:
+        return SessionCheckpointingCapability(supported=False)
+
+    async def discard_session(self, request: Request) -> DiscardSessionResponse:
+        """Release state for a session. Stateful implementations should override."""
+
+        return DiscardSessionResponse()
 
     @abstractmethod
     async def verify(self, body: BaseVerifyRequest) -> BaseVerifyResponse:

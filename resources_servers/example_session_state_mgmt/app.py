@@ -25,6 +25,13 @@ from nemo_gym.base_resources_server import (
     BaseVerifyResponse,
     SimpleResourcesServer,
 )
+from nemo_gym.episode_checkpoint import (
+    DiscardSessionResponse,
+    RestoreSessionRequest,
+    RestoreSessionResponse,
+    SessionCheckpointingCapability,
+    SessionSnapshot,
+)
 from nemo_gym.server_utils import SESSION_ID_KEY
 
 
@@ -72,6 +79,35 @@ class StatefulCounterResourcesServer(SimpleResourcesServer):
         session_id = request.session[SESSION_ID_KEY]
         self.session_id_to_counter.setdefault(session_id, body.initial_count)
         return BaseSeedSessionResponse()
+
+    async def checkpoint_session(self, request: Request) -> SessionSnapshot:
+        session_id = request.session[SESSION_ID_KEY]
+        if session_id not in self.session_id_to_counter:
+            raise RuntimeError("Cannot checkpoint an unseeded counter session")
+        return SessionSnapshot(
+            format_name="example_session_state_mgmt.counter",
+            payload={"count": self.session_id_to_counter[session_id]},
+        )
+
+    async def session_checkpointing(self) -> SessionCheckpointingCapability:
+        return SessionCheckpointingCapability(
+            supported=True,
+            format_name="example_session_state_mgmt.counter",
+            format_version=1,
+        )
+
+    async def restore_session(self, request: Request, body: RestoreSessionRequest) -> RestoreSessionResponse:
+        if body.snapshot.format_name != "example_session_state_mgmt.counter":
+            raise ValueError(f"Unsupported snapshot format: {body.snapshot.format_name}")
+        if body.snapshot.format_version != 1:
+            raise ValueError(f"Unsupported counter snapshot version: {body.snapshot.format_version}")
+        session_id = request.session[SESSION_ID_KEY]
+        self.session_id_to_counter[session_id] = int(body.snapshot.payload["count"])
+        return RestoreSessionResponse()
+
+    async def discard_session(self, request: Request) -> DiscardSessionResponse:
+        self.session_id_to_counter.pop(request.session[SESSION_ID_KEY], None)
+        return DiscardSessionResponse()
 
     async def increment_counter(self, request: Request, body: IncrementCounterRequest) -> IncrementCounterResponse:
         session_id = request.session[SESSION_ID_KEY]

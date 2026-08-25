@@ -19,6 +19,12 @@ workplace_assistant_simple_agent:
       model_server:
         type: responses_api_models
         name: policy_model
+      mid_episode_resume:
+        enabled: true
+        require_policy_version: true
+        checkpoint_store:
+          type: filesystem
+          root_dir: ${oc.env:NEMOGYM_EPISODE_CHECKPOINT_DIR}
       datasets:
         - name: train
           type: train
